@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+
+# IDE
+.idea/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Test & type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# dtex local state
+.duckdb
+.dtex/
+
+# Local secrets (e.g. the gads OAuth refresh token written by the
+# get_refresh_token helper) — never commit these.
+.secrets/

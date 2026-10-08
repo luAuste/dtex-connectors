@@ -1,0 +1,175 @@
+# 00 — Vision & Naming
+
+> Part of the **dtex** design handbook. This file sets the north star. Files
+> 01 (landscape) and 02 (architecture) build on the vocabulary and the
+> simplicity test defined here.
+
+## What dtex is
+
+**dtex** ("data extraction tool") is an open-source Python extract-load (EL) tool. It
+moves data from a **source** (an API, a database, a file drop) into a
+**destination** (a warehouse, a database, an object store) and nothing more.
+Transformation is somebody else's job — dbt's, specifically.
+
+The mental model is **a dbt-shaped extract-load tool**:
+
+- **Connectors are ordinary Python** — generator functions decorated with
+  `@stream` / `@resource`. No subclasses to learn, no plugin system to fight.
+- **Pipeline state lives in the destination**, not in a control plane —
+  `_dtex_state` is a row in your warehouse alongside the data it tracks.
+- **You work in a project folder** of plain files, run it with a CLI
+  (`dtex run`), select work with **configs**, and configure environments with
+  **profiles** — same shape as a dbt project. The engine is a pip-installable
+  library; the project is yours and lives in your repo, under version control,
+  reviewable in a PR.
+
+dtex has three faces, and they are equal first-class citizens:
+
+| Face | Analogy | What it is |
+|------|---------|-----------|
+| **Engine / library** | `dbt-core` | The `dtex` Python package: the run loop, the connector contract, baked connectors, the importable API. |
+| **CLI** | the `dbt` binary | `dtex` — installs via pip, runs a project folder. |
+| **Project** | a dbt project | A user-owned folder of connector definitions, profiles, and config. |
+
+A connector — source **or** destination — is a **folder**: a mandatory
+`register.yaml` manifest plus Python files using decorators on plain functions.
+Sources and destinations share that *folder + manifest + decorator* contract; the
+decorators differ by direction — sources expose `@stream` / `@resource`
+generators that **yield** records, destinations expose `@destination`-hooked
+functions that **accept** them. A class form is a documented escape hatch but is
+never mandatory.
+
+dtex **ships pre-baked** connectors and destinations inside the `dtex`
+package (`connector="meta_ads"`). Users also write **custom** ones in their own
+project folder (`connector="custom"`). Same contract for both.
+
+Runs are **synchronous** — "run, wait until it succeeds, exit." That makes
+dtex trivially easy to wrap in an orchestrator (Dagster, Airflow, cron) later,
+because a synchronous process with an exit code is the universal contract.
+
+## Non-goals
+
+dtex does one job — extract-load — and explicitly does not do several adjacent
+ones:
+
+- **dtex does not provide a UI.** Connectors are code in a repo, not rows in a
+  database edited through a web form. The source of truth is the filesystem.
+- **dtex does not run connectors out-of-process.** Connectors are imported and
+  executed as in-process Python — no JSON-over-stdio protocol, no
+  container-per-connector, real stack traces. Singer and Airbyte shuttle
+  `RECORD` / `SCHEMA` / `STATE` messages between separate OS processes; dtex
+  does not.
+- **dtex does not express stream *logic* in YAML.** YAML is the manifest
+  (metadata, declared streams, config schema) and only the manifest. The
+  *logic* of a stream is a Python generator. YAML that needs an `if` is a
+  programming language with the safety removed.
+- **dtex does not host a control plane.** State lives in your destination
+  (`_dtex_state`), not in a dtex-managed service. There is no dtex backend,
+  no scheduler daemon, no telemetry endpoint.
+- **dtex does not transform data.** Use dbt.
+- **dtex is not an orchestrator, a reverse-ETL platform, a catalog, or a
+  managed SaaS.**
+
+What dtex *keeps* from the Airbyte / Singer world: a **YAML manifest**
+(`register.yaml`) for declarative *metadata and config* — analogous in spirit
+to Airbyte's `metadata.yaml`, not its `manifest.yaml`. Declaring *what a
+connector is* in YAML is good. Encoding *what a connector does* in YAML is the
+mistake.
+
+(The full list of v1 non-goals — including CDC, distributed execution, and a
+connector marketplace — is in "Non-goals for v1" below.)
+
+## The "simplest possible thing" north star
+
+The #1 principle is **keep it as simple as possible.** This is not a slogan
+— it is a **test** applied to every design decision:
+
+> **The simplicity test.** For any proposed feature or abstraction, ask:
+> 1. Can a competent data engineer who has never seen dtex read a connector
+>    folder and understand it in under five minutes?
+> 2. Does this add a *concept the user must learn*? If yes, does it remove at
+>    least one other concept, or unlock something genuinely impossible without it?
+> 3. Could the user do this with plain Python instead? If yes, the burden of
+>    proof is on the abstraction, not on plain Python.
+> 4. Does it require a new config file, a new CLI flag, or a new lifecycle phase?
+>    Each of those is a cost paid by every user forever.
+
+A feature that fails the test is cut or demoted to an escape hatch. When two
+designs are both correct, **the one with fewer concepts wins** — even if it is
+less powerful. Power that costs comprehension is, for dtex, a net loss.
+
+This is why connectors are folders of plain Python: a data engineer already
+knows folders, YAML, and generators. It is why state lives in the destination:
+no extra state service to learn, deploy, or back up. It is why runs are
+synchronous: no scheduler, no queue, no daemon — just a process.
+
+## Naming & branding
+
+The product, the CLI binary, the Python package, and the import name are all
+spelled the same way: **`dtex`** — lowercase, three letters, like `dbt`. It
+stands for "data extraction tool."
+
+| Thing | Form | Notes |
+|-------|------|-------|
+| Product name | **dtex** | Always lowercase. "data extraction tool." |
+| CLI binary | `dtex` | `dtex run -p shiphero_prod` — the `-p / --conf` arg names a pipeline config (chapter 12). |
+| Python package / import | `dtex` | `import dtex` / `from dtex import run`. |
+| Runtime unit | **config** | A pipeline (one source + one destination + one target + params). Lives under `configs/` (chapter 12). |
+| State table | `_dtex_state` | Underscore-prefixed, lives in the destination. |
+| Project config | `dtex_project.yml` | The dbt-style project manifest at the project root. |
+| Per-destination connection params | `profiles.yml` | dbt-outputs style: top-level keys are destination names, each with `default_target:` + `targets:`. |
+| Working dir | `.dtex/` | Disposable build/cache/log output. Git-ignored. The `target/` analog. |
+| Synced-at column | `_dtex_synced_at` | Engine-appended load timestamp on every loaded table. |
+
+Rationale: one identifier for everything is the simplest thing. Borrowing the
+dbt convention (`dbt` the binary, `dbt` the package, `dbt_project.yml`) keeps
+the analogy clean for the target user (see §Target user below). Underscore-
+prefixed names (`_dtex_state`, `_dtex_synced_at`, `_dtex_runs`) mark the
+engine-owned namespace inside the destination so it sorts away from user
+tables and columns.
+
+> Provenance: the tool was previously called `det` (a PyPI name collision
+> forced the change) and then briefly `detx`; renamed to `dtex` before the
+> first public release because the latter reads more naturally aloud. The
+> shape of the identifier convention is unchanged across all three.
+
+## Target user
+
+The target user is a **data engineer who currently hand-writes one-off connector
+scripts** — the person with a `scripts/` folder full of `pull_stripe.py`,
+`sync_hubspot.py`, each re-implementing pagination, retries, incremental
+cursors, and "where did I leave off" bookkeeping slightly differently.
+
+dtex offers that person a deal: **keep writing Python generators — that part
+was never the problem — and we will take the boilerplate.** State, schema
+inference, batching, retries, the destination write, the run record: handled. In
+exchange they adopt one contract (folder + `register.yaml` + decorators).
+
+dtex is **not** aimed at non-technical users (that is Airbyte's UI market) or
+at teams who want a managed SaaS with an SLA (that is Fivetran's market). It is
+aimed at engineers who want their EL layer to look like their dbt layer:
+plain files, in a repo, in a PR, run from a CLI.
+
+## Non-goals for v1
+
+v1 scope is **CLI + library only**. Explicitly out of scope for v1:
+
+- **No UI.** No web app, no connector builder. (Possible far-future; not v1.)
+- **No built-in scheduler / orchestrator.** dtex runs once and exits.
+  Scheduling is cron's or Dagster's job. dtex's contribution is being a
+  clean synchronous process that an orchestrator can wrap.
+- **No transformation / T layer.** EL only. Hand off to dbt.
+- **No reverse-ETL framing.** A warehouse→SaaS sync is just a connector pair, but
+  v1 does not build first-class reverse-ETL ergonomics.
+- **No CDC / log-based replication** as a built-in. Cursor-based incremental
+  only in v1; whether a connector author can implement CDC themselves
+  within the `@stream` contract is a v2 question — see
+  [chapter 10](./10-roadmap-and-scope.md) and [chapter 11 Q5](./11-open-questions.md).
+- **No distributed / multi-node execution.** Single process, single host.
+- **No data catalog, lineage graph, or column-level metadata store.** dtex
+  emits a **run record**; it is not a metadata platform.
+- **No connector marketplace.** Baked connectors ship in the package; everything
+  else is custom and lives in the user's project. A registry may come later.
+
+Each non-goal is a direct application of the simplicity test: every one of
+these would add concepts and surface area without doing the one job better.

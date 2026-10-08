@@ -1,0 +1,1569 @@
+# Changelog
+
+All notable changes to **dtex** will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+For what is *planned* — versus what has shipped — see
+[`docs/10-roadmap-and-scope.md`](./docs/10-roadmap-and-scope.md).
+
+## [Unreleased]
+
+## [0.20.1] — 2026-10-08
+
+### Added
+
+- `google_sheets` / `google_drive`: optional `impersonate_service_account`
+  mints a Sheets/Drive-scoped token for a service account (the runner's own
+  included) through the IAM Credentials API. Cloud Build and GCE hand the
+  attached identity a `cloud-platform`-only token, which the Sheets API
+  refuses; this gives those runtimes a keyless way to read a shared sheet.
+
+## [0.20.0] — 2026-10-06
+
+### Added
+
+- Baked Klaviyo destination for append-only event delivery: stable event
+  identifiers, original timestamps, explicit backfill behavior, bounded HTTP
+  retries and request-size limits. Checkpoints, leases and run history use a
+  separate DuckDB or BigQuery state store. Success records API acceptance;
+  asynchronous processing requires separate reconciliation.
+
+### Fixed
+
+- Pass resolved destination secrets into the destination's `open` hook. The
+  engine previously resolved and registered these secrets for redaction but
+  discarded them when initializing the destination.
+
+## [0.19.0] — 2026-09-29
+
+### Added
+
+- **Baked `google_sheets` source.** Point it at a spreadsheet link (or ID) and
+  every tab lands as its own table — `streams: all` picks up tabs added later.
+  `tabs: "Orders!A2:N, Refunds!A2:N10, gid=123"` narrows it to chosen tabs and
+  A1 ranges, open-ended (`A2:N`, to the last row) or bounded; the same knobs
+  (`range`, `header_row`, `columns`) work per stream in a config. Stream names
+  are the slugified tab titles, computed over every tab so a filter never
+  renames one; titles that slugify alike get their permanent gid appended.
+  Values are read unformatted (numbers, booleans, text) and dates from their
+  exact serial numbers, typed per cell by number format (`DATE` → date,
+  `DATE_TIME` → timestamp in the spreadsheet's time zone). Header names
+  become `snake_case` columns (blank → `column_<n>`, duplicates → `_2`), and
+  each column settles on one type. Full refresh (`replace`) per run; a cleared
+  tab clears its table.
+- **Baked `google_drive` source.** CSV, XLSX and native Google Sheets files in
+  a Drive folder — My Drive or a shared drive — unioned into one table like the
+  `filesystem` source (`folder`, `glob` on file names, `recursive`, `format`),
+  incremental by file on a `<modifiedTime>|<fileId>` cursor so each run loads
+  only new or modified files. XLSX via openpyxl with `sheet` (name or position),
+  `range` and `header_row` — the same rules as `google_sheets`, so a CSV and an
+  XLSX with one layout land with the same columns. Records carry
+  `_dtex_file_id`, `_dtex_file_path` and `_dtex_file_cursor`. Several tables
+  from one folder: a project-local copy calling `extract_files(..., glob=…)`
+  per stream.
+- Both Google sources authenticate with Application Default Credentials or a
+  service account (`credentials_path`, or `credentials_json` as a `${env.X}` /
+  `secret://` reference — never an inline key), and retry 429 / 5xx and Drive
+  rate-limit 403s with backoff. `openpyxl` and `google-auth` join the base
+  dependencies.
+- **Discovered streams** (docs/03 §2.2.3). A source can declare a stream
+  *template* (`discover: true`) plus a `@discover(stream=…)` hook that returns
+  `DiscoveredStream(name, table, context)` objects at run time; the engine
+  expands the template into one ordinary stream per result — selectable in
+  `streams:` with per-stream `params`, with its own table and `_dtex_state` row.
+  Name collisions and unknown names are hard errors. `google_sheets` is built
+  on it.
+
+### Fixed
+
+- With batch coalescing on (BigQuery's `min_batch_rows`), a `replace` stream
+  that yielded only an empty batch never reached `write_batch`, so the table
+  kept the previous run's rows instead of being truncated. The empty snapshot
+  is written again, as it is without coalescing.
+
+## [0.18.0] — 2026-09-24
+
+### Added
+
+- **Batch coalescing for destinations with a high per-write cost.** A new
+  optional destination hook, `@destination.min_batch_rows`, lets a
+  destination ask the engine to buffer a stream's source batches until at
+  least that many rows are pending before each `write_batch`. BigQuery
+  declares it (default 10000, `min_batch_rows` destination param; `0` keeps
+  the old one-write-per-batch behaviour): every BigQuery write is a GCS
+  upload + LOAD job (+ MERGE), several seconds of fixed cost, so sources that
+  yield one API page per batch paid it per page — a full Stripe backfill ran
+  at ~8 s per 100-row page (≈3 h for 137k charges). The buffer is written the
+  moment it reaches the threshold, before the source is asked for more, so
+  mid-stream state flushes keep their commit-after-write guarantee; lease
+  heartbeats continue while the buffer fills.
+
+### Fixed
+
+- konnektive: Konnektive's per-endpoint refusal (`API user does not have
+  access to this endpoint`) is now an auth error — raised at once, never
+  retried. It was being treated as transient and retried five times, so a
+  missing endpoint permission surfaced after ~70 seconds instead of one.
+
+## [0.17.0] — 2026-09-21
+
+### Changed
+
+- **Baked `revenuecat` source 2.0: period-grain transactions, and a fetch
+  plan that cannot lose a purchase.** RevenueCat v2 has no change feed: the
+  customers list carries no purchase signal, subscriptions exist only per
+  customer and transactions only per subscription. 1.x answered that by
+  fanning out over every customer on every run (hours on a real project) and
+  landed no transactions at all. 2.0 adds `products`,
+  `entitlement_products`, `customer_details`, `subscription_transactions`
+  (one row per store transaction, USD and local amounts, the first-seen gross
+  that survives a refund, `refund_detected_at`) and `reconciliation_daily`,
+  and rebuilds `subscriptions` around `targets.py`:
+  - Customers without a live subscription are re-checked on a fixed, decaying
+    schedule after RevenueCat last saw them (hourly at first, thinning out to
+    30 days). The schedule is a pure function of the customer's timestamps and
+    the only memory is a watermark that advances over work that actually
+    finished, so a failed run, an outage or a capped backlog widens the next
+    window instead of dropping anyone.
+  - There is no "this customer has no subscriptions, skip them" memory. A
+    project-local predecessor of this connector had one and silently dropped
+    about 13% of new subscriptions: `last_seen_at` does not reliably move when
+    a customer buys (20 of 2,104 first purchases came more than an hour after
+    the final sighting, the longest 20 hours later), so a customer seen,
+    fetched empty and then buying was never fetched again.
+  - Recently active subscribers are refreshed every run, long-expired ones on
+    a slow rotation; optional operator SQL can name probable changes (a fast
+    path) or known purchasers (bootstrap and safety net).
+  - `reconciliation_daily` compares landed transactions per UTC day with
+    RevenueCat's own chart count. A recent short day makes `subscriptions`
+    re-check every plausible customer around it; an older one is what a
+    warehouse test should alert on.
+  - The customers walk runs as 33 concurrent cursor chains (minutes instead of
+    over an hour for 250k customers) and is gap-free under any list order: it
+    never compares ids, each chain stops where the next one started.
+  - The diff streams read their previous snapshot back from the destination
+    (`landed_reader: bigquery | duckdb`, `landed_dataset`); the other streams
+    run without it.
+  Upgrading from 1.x: see the connector README. `subscriptions` gains columns
+  and loses `customer_last_seen_at`.
+
+### Fixed
+
+- **`revenuecat.metrics_daily` no longer freezes a day at its first reading.**
+  Each run started at the last complete day, so `metrics_lookback_days` never
+  took effect and values RevenueCat revised later (refunds, late store
+  notifications) were never re-pulled. Every run now re-pulls the trailing
+  window; a first run backfills from `metrics_initial_since_date` in 90-day
+  requests.
+
+## [0.16.1] — 2026-09-21
+
+### Fixed
+
+- **DuckDB: a stream that runs longer than a minute no longer fails.** The
+  DuckDB destination loads each stream inside one transaction, and the engine
+  refreshes the run's stream leases between batches once 60 seconds have
+  passed. That refresh opened a transaction of its own; DuckDB has no nested
+  transactions, so the second `BEGIN` raised (logged as `failed to refresh
+  leases`) and — the damaging part — marked the stream's transaction aborted.
+  The next batch then died with `TransactionContext Error: Current
+  transaction is aborted (please ROLLBACK)` and the stream rolled back. The
+  lease refresh now joins the open stream transaction. BigQuery was never
+  affected; nor were DuckDB streams that finished inside the first minute,
+  which is why local smoke runs hid it.
+
+## [0.16.0] — 2026-09-21
+
+### Added
+
+- **Baked `konnektive` source connector** — the Konnektive (Checkout Champ)
+  CRM API. Five `merge` streams: `orders`, `transactions`, `purchases`,
+  `customers`, and the per-day `summary` report. The four query streams are
+  incremental on `dateUpdated`. Konnektive's date filter is day-granular (a
+  time in `startDate` / `endDate` is accepted and ignored), so the walk is
+  in whole-calendar-day windows (`window_days`) with a `lookback_days`
+  overlap, and the cursor's own day is always re-pulled in full. The cursor
+  commits per completed window (`ordered: true`), so a long history backfill
+  resumes where it died. Konnektive's documented fields land as columns
+  under the API's own names, nested values as JSON, and every row carries
+  the whole object under `raw` — minus `exclude_fields`, which by default
+  strips `eCommercePassword`, `achAccountNumber` and `achRoutingNumber`
+  before anything lands. Date-times are account-local wall-clock strings and
+  land as `STRING`, untouched. Credentials travel in a POST form body by
+  default so they never appear in a URL; auth failures — including
+  Konnektive's per-user IP allow-list rejection — are raised immediately and
+  never retried; its "no results" `ERROR` reads as an empty window.
+  `start_date` is a required param. The runner needs a stable egress IP.
+
+## [0.15.0] — 2026-09-21
+
+### Added
+
+- Meta connector: `hourly_fields` param for the `insights_hourly` stream,
+  so a config can request more campaign-level metrics per hour (e.g.
+  `outbound_clicks`) without a code change. Defaults to the previous fixed
+  list, so existing configs are unchanged; the run fails fast if the list
+  drops a key field (`account_id`, `campaign_id`, `date_start`).
+- Declare a stream's natural grain with `incremental.max_staleness` (e.g.
+  `35d` for a monthly report, `2h` for a half-hourly one), and check every
+  stream against its own limit with `dtex state list --stale`, which exits 1
+  if any cursor is overdue. A zero exit code from `dtex run` means the
+  extraction worked, not that the data moved; one project-wide staleness
+  threshold cannot serve streams whose cadences differ by orders of magnitude,
+  which pushes teams to exempt the noisy ones and so lose the check where it
+  was working. Streams declaring no `max_staleness`, and cursors that are not
+  points in time, report as *unchecked* rather than `ok`. Advisory only — no
+  engine behaviour changes.
+
+## [0.14.4] — 2026-09-12
+
+- Fix promoted-column type drift with additive `streams.<name>.schema`
+  declarations. Null-only first batches now retain configured portable types,
+  preventing a STRING staging column from failing a numeric BigQuery MERGE.
+- Preserve source-declared columns, types, and modes; validate conflicting or
+  duplicate declarations before extraction. Schemaless sources keep inference
+  for all unconfigured columns. Source manifests remain immutable across runs.
+- Document typed Klaviyo promotions and update the bundled config/debug skills.
+  Regression coverage includes null-first batches, numeric strings, repeated
+  merges into new/existing tables, and declared-schema protection.
+
+## [0.14.3] — 2026-09-12
+
+- Fix full-table BigQuery scans for merges whose partition column belongs to
+  the primary key. Static bounds come from each staging batch; mutable
+  non-key partitions retain the unrestricted merge to avoid duplicate rows.
+- Use Klaviyo events' immutable `(id, datetime)` merge key to enable date
+  pruning. A live 2,000-row replay on a 72.8-million-event clone processed
+  56.3 MB instead of an estimated 188.8 GB, updating all rows without duplicates.
+- Preserve declared raw attributes/relationships on campaigns and campaign/flow
+  messages, including fields not individually promoted.
+- Add regression cases covering supported partition types, unsafe keys,
+  type validation, and the destination write path.
+
+## [0.14.2] — 2026-09-11
+
+### Fixed
+
+- Klaviyo profiles retain full `attributes`, `relationships`, and `links`
+  payloads alongside typed columns, preserving unpromoted fields during
+  migration and future API additions.
+- Klaviyo list payloads survive schema projection; metrics, flows, and
+  lists also preserve their top-level JSON:API links.
+
+## [0.14.1] — 2026-09-11
+
+### Fixed
+
+- Klaviyo event queries end one minute before the run starts, avoiding
+  future-date validation errors when the runner and API clocks differ.
+  All metrics retain a shared upper bound, and the next incremental run
+  fetches the deferred events through the existing three-day lookback.
+
+### Documentation
+
+- Connector-authoring guidance now explains preserving tenant-defined
+  properties as raw payloads and making typed promotions optional.
+
+## [0.14.0] — 2026-09-11
+
+### Changed
+
+- **`klaviyo` lands every payload whole, and promotes nothing by default.**
+  The first cut of the connector typed the fields *one account* happened to
+  need — `invoice_id` from `Invoice.ID`, `payment_intent` from
+  `$extra.PaymentIntent` — and dropped the rest of `event_properties` into a
+  JSON column. That is the same mistake the connector was written to fix,
+  with a different set of casualties: `event_properties` is **arbitrary per
+  account**. A Stripe integration emits `Invoice` and `$extra`, a Shopify one
+  emits `OrderId` / `SKU` / `Categories`, a custom integration emits whatever
+  that team invented. Columns fitted to one account are NULL everywhere else,
+  and the fields that matter to everyone else are invisible.
+
+  Now: only fields Klaviyo itself guarantees are typed — the event envelope,
+  the metric/profile relationships, its reserved `$event_id` and `$value`,
+  and the attribution columns. Everything else is landed whole, in three
+  JSON columns on `events` (`attributes`, `relationships`,
+  `event_properties`) and in `attributes` / `relationships` on every catalog
+  stream. Nothing an account sends can be lost, whatever it is.
+
+  Account-specific fields become a **config** decision via the new
+  `promote_properties` param — `column=json.path` pairs, empty by default:
+
+  ```yaml
+  params:
+    promote_properties: "invoice_id=Invoice.ID,payment_intent=$extra.PaymentIntent"
+  ```
+
+  Promoted columns are added to the projection automatically, so no schema
+  override is needed.
+
+  Landing the full `attributes` object has a second payoff: an
+  Airbyte-shaped `JSON_VALUE(attributes, '$.event_properties."$campaign"')`
+  extraction keeps working after a source repoint, so migrating a dbt project
+  off `source-klaviyo` stops being a model rewrite.
+
+  **Breaking:** `events.invoice_id` and `events.payment_intent` are gone as
+  built-in columns. Restore them for a Stripe-backed account with the
+  `promote_properties` line above.
+
+## [0.13.0] — 2026-09-11
+
+### Added
+
+- **A `klaviyo` source connector** — 18 streams over Klaviyo's JSON:API. It
+  exists for three things that are genuinely hard to get out of Klaviyo, each
+  of which fails *silently*: the table looks complete and the columns are
+  simply empty.
+
+  **Attribution.** Klaviyo decides which flow, campaign and message it credits
+  a conversion to, and that verdict is not on the event. Revision
+  `2024-02-15` removed `$attribution` from `event_properties` and moved it to
+  an `?include=attributions` sidecar. Airbyte's connector sends the include
+  but never joins the `included` block back onto the event
+  (airbytehq/airbyte#54174), so the warehouse gets an opaque attribution id
+  and nothing else — every "which email drove this revenue?" question has to
+  be asked in Klaviyo's UI instead of next to your own revenue data. This
+  connector parses `included` and folds the ids onto the event row:
+  `attributed_flow_id`, `attributed_flow_message_id`,
+  `attributed_campaign_id`, `attributed_campaign_message_id`,
+  `attributed_event_id`, plus a derived `attributed_channel`. Deeper includes
+  (`attributions.flow`) are rejected by the API with a 400 and
+  `fields[attribution]` accepts only `id`, so ids are as far as one request
+  reaches; the catalog streams supply the names.
+
+  **Late attribution.** Klaviyo events are immutable and carry no
+  `updated_at` — `datetime` is when the event happened, and attribution is
+  written up to ~3 hours later (airbytehq/airbyte#61001). A plain cursor on
+  `datetime` therefore extracts most conversions *before* their attribution
+  exists and never revisits them. The `events` stream declares `lookback: 3d`,
+  `write_disposition: merge` on the event id, and `ordered: false` — three
+  declarations that only work together: the re-walk re-fetches, the merge
+  overwrites the NULL in place, and the unordered flag stops a mid-run state
+  flush from advancing the cursor past events whose attribution has not
+  landed yet.
+
+  **Consent.** `subscriptions` is not in a default `/profiles` response.
+  Without `additional-fields[profile]=subscriptions` every consent column is
+  NULL and the profile table cannot say whether anyone is contactable. The
+  connector requests it and flattens the answer — including the suppression
+  list, because a profile can read `SUBSCRIBED` and still be unreachable
+  after a hard bounce. Klaviyo's predictive analytics ride the same field.
+
+  Also landed: the Reporting API (`campaign_reports`, `flow_reports`,
+  `segment_reports`), which is the only surface that reproduces Klaviyo's own
+  UI numbers — the app buckets by *send date* while the event stream buckets
+  by *event time*, which is why an event-derived open rate never matches the
+  dashboard being quoted at you. Plus segments and their definitions, list and
+  segment membership (with `external_id`, for direct customer joins), tags,
+  forms, templates, and the account's timezone and currency.
+
+  Events carry `profile_email` / `profile_external_id` inline via
+  `include=profile`, so an event-to-customer join does not depend on the
+  `profiles` stream having caught up. Campaign catalogs walk archived
+  campaigns in a second pass — Klaviyo hides them by default, and an
+  attributed event can reference a campaign archived years earlier.
+
+## [0.12.7] — 2026-09-11
+
+### Fixed
+
+- **`gads` no longer stores NULL for a metric whose value is zero.** Google
+  serves `GoogleAdsRow` as protobuf JSON, which **omits** any field holding
+  its default value: a row with no video views carries no
+  `videoQuartileP100Rate` key at all, even though the API's own UI renders it
+  as `0.0`. The connector passed that absent leaf through as `None`, so the
+  column landed NULL instead of 0. It hid well — `SUM` ignores NULLs, so
+  totals looked correct, while `AVG` silently dropped those rows from its
+  denominator (one real table averaged 0.043 but read 0.217, 5x high) and
+  downstream `not_null` tests began failing on data that was never missing.
+  An absent `metrics.*` leaf is now `0`. Dimensions are deliberately
+  untouched: an absent dimension genuinely is unknown, and NULL is the honest
+  value there.
+
+  Integer and float metrics were already unaffected in practice, because the
+  engine's NORMALIZE step coerces a missing value of those types to 0 — the
+  bug surfaced on the rate/ratio columns that normalize to NULL.
+
+## [0.12.6] — 2026-09-10
+
+### Added
+
+- **`dtex state set -p <config> --stream <s> --cursor <value>`** — move one
+  stream's cursor without re-extracting anything. The counterpart to
+  `state reset`: reset throws state away so the next run re-pulls from
+  `initial_value`, while `set` moves the cursor to a value you already know
+  is correct. The motivating case is data that is *already* loaded while the
+  cursor was lost or never advanced — a state table restored from backup, a
+  destination migration, or a connector bug that failed to observe the
+  cursor. Without this the only recovery was re-extracting the full history
+  to rediscover a date readable off the loaded rows; one such pipeline faced
+  a 4-hour re-pull of 2.6 years to recover a single known date.
+
+  Unlike `reset`, which reaches past the hook contract to issue a DELETE and
+  so works only on SQL-backed destinations, `set` goes through the
+  destination's own `commit_state` hook — so it works on every Tier-A
+  destination, BigQuery included.
+
+  The value is validated against the stream's **declared** `cursor_type`
+  before anything is written: a `date` cursor must be `YYYY-MM-DD` (storing
+  `2026-08-18T00:00:00` would compare wrong against `date.fromisoformat` on
+  the next run), a `timestamp` accepts ISO-8601, a trailing `Z`, or a bare
+  date as midnight UTC, and an `int` must parse as an integer. An unknown
+  stream is refused with the list of declared streams rather than writing an
+  orphan row the engine would never read, and a non-incremental stream is
+  refused outright. `state_blob` — the mid-stream resume pointer for
+  `ordered` streams — plus `rows_total` and `last_run_id` are preserved, so
+  setting a cursor never strands a partially-walked stream.
+
+## [0.12.5] — 2026-09-10
+
+### Fixed
+
+- **`gads` cursors no longer freeze when a stream renames its date column.**
+  `_extract_gaql` found the last complete day with a hardcoded
+  `flat.get("date")` lookup. Every baked stream maps `segments.date` to a
+  column literally named `date`, so this always worked in-tree — but a
+  connector may map it to any name, and a project source matching an existing
+  warehouse table calls it `segments_date`. For those the lookup returned
+  `None`, `max_complete` was never set, `cursor.observe()` was never called,
+  and the cursor stayed pinned at `initial_value` forever. The run still
+  reported success, so the symptom was not an error but a pipeline that
+  re-pulled its **entire history on every run** — a 348k-row "incremental"
+  run, and a `stream_committed` event carrying `cursor_after=None`. The
+  column is now read from the register's declared
+  `incremental.cursor_field`, falling back to `"date"` only when a stream
+  declares no `incremental:` block. Anyone whose gads cursors show
+  `cursor_after=None` after a successful run was hitting this; the next run
+  on 0.12.5 advances them normally, with no state reset needed.
+
+## [0.12.4] — 2026-09-10
+
+### Fixed
+
+- **`gads` incremental streams no longer skip their whole backfill.** The
+  date window was `max(cursor or segments_initial_since_date, today -
+  segments_lookback_days)`, which is wrong at both ends. On a **first run**
+  there is no cursor, so the initial start date was compared against
+  `today - lookback` and lost: a `segments_initial_since_date` of
+  2024-01-01 with a 14-day lookback backfilled only the last 14 days,
+  silently skipping 969 days of history. Worse, an account with no activity
+  in that trailing window (paused campaigns, a seasonal advertiser) produced
+  a run that "succeeded" with zero rows and looked like a healthy no-op. On a
+  **resumed run** the same `max()` always picked the cursor over
+  `cursor - lookback`, so the declared lookback re-pulled nothing at all and
+  Google Ads' late-landing conversions (view-through and modelled
+  conversions restate for weeks) were never picked up. A first run now uses
+  `segments_initial_since_date` verbatim, and a resumed run starts at
+  `cursor - lookback`; a cursor somehow ahead of today is clamped. Anyone
+  whose gads streams were first run with a lookback shorter than their
+  intended history should re-run those streams with the state reset.
+  `_date_window` had no direct test coverage — the one test that touched it
+  set `segments_lookback_days: 0`, which is exactly the value that makes the
+  old and new behaviour agree; it now has tests for both ends of the window.
+
+- **BigQuery `merge` streams no longer orphan `__staging_*` tables.** The
+  target's schema evolution ran *between* the staging-table load and the
+  `try`/`finally` that drops it, so a failure there (a column type
+  conflict, or BigQuery's concurrent-modification / rate-limit errors on
+  table metadata — easy to hit when several streams evolve tables in one
+  dataset under `--threads N`) left a
+  `{target}__staging_{run_suffix}_{uuid}` table behind permanently. The
+  target is now evolved *before* the staging table is created, so every
+  failure path either predates the staging table or is inside the
+  `finally`. Staging tables are additionally created with a 24h
+  expiration, so BigQuery reaps the one case no `finally` can cover — the
+  process being killed mid-MERGE (SIGKILL / OOM / container eviction).
+  Orphans were harmless to correctness (the names are unique per batch, so
+  they never collide with a later run) but cluttered the dataset and cost
+  storage.
+
+## [0.12.3] — 2026-09-10
+
+### Fixed
+
+- **`gads` refresh-token helper no longer loses a completed consent.**
+  `get_refresh_token` called `handle_request()` exactly once, so the *first*
+  HTTP request of any kind closed the loopback server. Browsers routinely
+  fetch `/favicon.ico` or probe the origin before following a redirect, so
+  the genuine callback then arrived at a dead port: the user saw
+  `ERR_CONNECTION_REFUSED` after clicking *Allow*, with a valid (and
+  short-lived) authorization code stranded in the URL bar and no way to spend
+  it. Requests carrying neither `code` nor `error` are now answered `404` and
+  ignored, and the server keeps serving until the real redirect lands or the
+  new `--timeout` (default 300s) expires — it previously blocked forever on
+  an abandoned consent. Three related gaps closed at the same time: the
+  `state` parameter was generated and sent but never compared on the way back
+  (so a stray or forged redirect was accepted — it is now verified); a taken
+  port raised a bare `OSError` instead of naming `--port`; and a failed
+  `webbrowser.open()` passed silently, which is the normal case over SSH or
+  in a container. New `--code` flag exchanges an authorization code directly,
+  which rescues exactly the consent the first bug used to throw away. The
+  helper had no test coverage; it now has regression tests for each fix.
+
+## [0.12.2] — 2026-09-09
+
+### Fixed
+
+- **`intercom` contacts land their full `tags`, `companies` and `notes`
+  lists.** Intercom embeds at most 10 entries of each list on a contact
+  object and marks the truncation (`has_more: true`, `total_count`); the
+  search stream shipped that truncated embed — the same cap Airbyte's
+  connector has. Contacts flagged `has_more` now get the complete list via
+  `GET /contacts/{id}/<list>` (one extra call per flagged contact), landed
+  in the same envelope shape with `has_more: false`.
+
+## [0.12.1] — 2026-09-09
+
+### Fixed
+
+- **`intercom` search streams load in `batch_size`-row batches, not one
+  per API page.** Each 150-row page was yielded as its own batch, i.e. one
+  destination load job per page; a first backfill of a few hundred thousand
+  contacts would have taken hours and blown through BigQuery's load-jobs-
+  per-table-per-day quota. Pages are now buffered up to `batch_size`
+  (default 5000; `conversation_parts`, `companies` and `articles` default
+  to 2000), and the cursor is observed for a completed window only once
+  that window's rows have been yielded, so `ordered: true` stays exact
+  under mid-run state flushes.
+
+## [0.12.0] — 2026-09-09
+
+### Added
+
+- **`intercom` baked source connector** (REST API v2.16; US / EU / AU
+  hosts). Twelve streams in the column shapes Airbyte's `source-intercom`
+  produces (top-level scalars as columns, nested objects as JSON,
+  unix-second timestamps as INTEGER), so a dbt project can move its
+  `source()` schema without touching models:
+  - `contacts`, `conversations`, `tickets` — `POST /<resource>/search`
+    windowed on `updated_at` (`window_days`, default 7), one page per
+    batch, `merge` on id, `ordered: true` with the cursor observed per
+    *completed* window so a mid-run flush never persists a value inside a
+    window still being walked. `tickets` flattens the 2.12+ `ticket_state`
+    object into `ticket_state` (category) plus the id and internal /
+    external labels.
+  - `conversation_parts` — the transcript: `GET /conversations/{id}` for
+    every conversation updated in the window, one row per part plus a
+    `conversation_source` row for the opening message; conversations are
+    fetched in ascending `updated_at` order and `max_conversations_per_run`
+    caps a backfill into resumable chunks.
+  - `companies` (`GET /companies/scroll`, merge), `articles` (page-number
+    pagination, merge), and `replace` dimensions `admins`, `teams`, `tags`,
+    `segments`, `ticket_types`, `data_attributes`.
+  - Client: Bearer token + `Intercom-Version` header, token-bucket pacing,
+    429 waits for `X-RateLimit-Reset` (bounded), 5xx / connection retries
+    with backoff, Intercom's `[code] message` errors surfaced verbatim, the
+    token never logged.
+
+## [0.11.0] — 2026-09-07
+
+### Changed
+
+- **`incremental.lookback` is now applied by the engine.** The handbook and
+  the `Cursor` docstring always said `cursor.start_value()` is "the persisted
+  cursor minus `lookback`", but the engine handed the stream the prior cursor
+  verbatim, so every register-declared window (`stripe` 6h, `cockroachdb` /
+  `postgres` 1h, project sources) was parsed and ignored. A resumed run now
+  starts at cursor minus the window; `initial_value` and a `since:` override
+  are untouched. Grammar: `<int><unit>` with `s`/`m`/`h`/`d`/`w`; an `int`
+  cursor takes a bare number as-is or a unit suffix in seconds (a Unix
+  timestamp cursor); a `date` cursor rounds up to whole days; a `string`
+  cursor rejects the key at discovery. The `shiphero` connector, which
+  subtracts its own `lookback_days`, no longer declares a register-level
+  lookback (it would have been applied twice).
+- **A failed or interrupted stream no longer advances its cursor.** Mid-stream
+  state flushes persisted the maximum cursor observed so far; for a stream
+  that yields older values late (a per-object fan-out that walks post A's
+  September comments before post B's August ones) a crash between the two
+  committed September as done and the next run skipped B. Flushes now keep
+  the **prior** cursor and the cursor advances only when the stream
+  completes. Streams that genuinely yield in cursor order — a keyset walk,
+  a date-window sweep — opt back into resume-from-last-batch with the new
+  `incremental.ordered: true` key; the `state_blob` resume pointer is
+  flushed either way.
+
+### Fixed
+
+- **A `merge` batch carrying the same primary key twice no longer lands the
+  key twice.** BigQuery `MERGE` inserts a key that is new to the target once
+  per staging row (no error), so overlapping API pages produced duplicate
+  rows with identical `_dtex_synced_at`; a duplicate that already existed
+  failed the statement instead. The engine now collapses each merge batch to
+  the last record per key before the write (logged), and the BigQuery
+  destination dedupes the staging table inside the `MERGE` as well.
+
+## [0.10.2] — 2026-09-05
+
+### Changed
+
+- Test fixtures, docstring examples and the `singular` connector's example
+  agency value now use neutral placeholder names. No functional change.
+  Earlier releases are being removed from PyPI; pin `>=0.10.2`.
+
+## [0.10.1] — 2026-09-04
+
+### Fixed
+
+- **A killed run no longer leaves a live stream lease** (vej-ai/dtex#1).
+  A run that died to `SIGTERM` (Cloud Build timeout / `INTERNAL_ERROR`,
+  Kubernetes eviction, `kill <pid>`) or Ctrl-C left its `_dtex_leases` rows
+  `running`, so every scheduled run for the next `LEASE_STALE_SECONDS`
+  (15 min) skipped the streams as "leased (live)" and moved no data —
+  while reporting success. `dtex.run` now installs a `SIGTERM` handler
+  for the duration of the run (main thread only, and only when no other
+  handler is set) that raises the new `dtex.RunInterrupted`; both it and
+  `KeyboardInterrupt` unwind through one `finally` that rolls back the
+  open per-stream transaction, **releases every lease the run holds**
+  (`failed`), writes the FAILED run record naming the interruption, and
+  closes the destination — then re-raises. The CLI exits `130` on Ctrl-C
+  and `143` on SIGTERM. The DuckDB destination's `transaction` /
+  lease hooks now roll back on `BaseException` as well, so the release
+  can run on the same connection.
+- **An interrupted lookback re-walk no longer moves the cursor
+  backwards** (vej-ai/dtex#1). The engine commits the observed cursor at
+  every mid-stream flush; a connector that re-walks `lookback_days`
+  behind its cursor observes ascending values *below* the prior cursor
+  first, so a run killed partway persisted the maximum of the partial
+  walk — days *behind* where it started — and freshness monitoring on
+  `_dtex_state.cursor_value` paged for a pipeline that was fine. The
+  committed value is now `max(observed, prior cursor)` at every flush and
+  at the final commit (compared typed across the JSON boundary, e.g. a
+  DATE cursor read back as `"2026-08-28"` against an observed `date`);
+  a virgin stream, `--full-refresh`, and `dtex state reset` are
+  unaffected, and a one-shot `since:` re-pull is clamped too (it re-pulls
+  rows, it does not rewind state). Incomparable values fall back to the
+  observed value with a warning.
+
+## [0.10.0] — 2026-09-04
+
+### Added
+
+- **New baked source: `meta`** — Meta (Facebook / Instagram) Marketing API
+  Insights, created by
+  [Auste Luksaite](https://www.linkedin.com/in/austeluksaite/). Two
+  streams, both incremental on `date_start` (DATE), `merge` on the natural
+  grain, partitioned by `date_start`, fetched through Meta's **asynchronous
+  report jobs** (`POST /act_<id>/insights` → poll `async_status` → page the
+  result with `after` cursors) because a synchronous ad-level GET over a
+  week of a large account fails with Meta's `code 1 / subcode 99`:
+  - `ads_insights` — one row per (day × ad account × ad), `level=ad`,
+    `time_increment=1`: ids + names down to the ad, `objective`,
+    `optimization_goal`, `impressions` / `reach` / `frequency` / `clicks` /
+    `unique_clicks` / `spend` / `social_spend` / `full_view_impressions`,
+    and the `actions` / `action_values` / `unique_actions` /
+    `conversions` / `conversion_values` / `video_p*_watched_actions` /
+    `video_time_watched_actions` breakdowns landed as JSON arrays of
+    `{action_type, value}`. The requested field list is the `fields`
+    param, so a field Meta retires is dropped in config.
+  - `insights_hourly` — one row per (day × hour-of-day × ad account ×
+    campaign), `level=campaign` with the
+    `hourly_stats_aggregated_by_advertiser_time_zone` breakdown. The
+    `"HH:00:00 - HH:59:59"` value is parsed into the INTEGER `hour` key
+    (raw kept as `hour_range`); the hour is in the AD ACCOUNT's timezone,
+    so each account's `timezone_name` / `timezone_offset_hours_utc` is
+    fetched once per run and stamped on every row for downstream
+    conversion.
+
+  Every run walks `max(cursor − lookback_days, start_date)` → today in
+  `window_days` windows × configured `account_ids` (comma-separated, with
+  or without `act_`); the default 28-day lookback is Meta's longest
+  attribution restatement window and `merge` upserts corrections in place.
+  The cursor is observed only after every account of a window has been
+  yielded. A window whose job keeps ending `Job Failed` / `Job Skipped` is
+  **bisected** (the job fails before any page is fetched, so nothing is
+  double-landed); a 1-day window that still fails raises. Transport:
+  paced requests (`page_delay_seconds`), hard `(10, 120)` s timeouts,
+  jittered bounded retry on 429 / Meta's rate-limit codes (4, 17, 32,
+  613, 80000–80014) / 5xx / transient codes 1–2, a proactive 60 s pause
+  when the `x-business-use-case-usage` / `x-ad-account-usage` headers
+  exceed 80 %, and immediate loud failure on deterministic errors (190
+  bad token, 200/10 missing permission, 100 bad field) with the token
+  redacted from every URL and message. Per-stream `params:` (e.g. a wider
+  `window_days` and later `start_date` for the ~100× smaller hourly
+  stream) size each backfill independently. Auth: `META_ACCESS_TOKEN`
+  (an `ads_read` token; a never-expiring Business Manager system-user
+  token is recommended). 19 new tests: stubbed Graph API transport, pure
+  helpers, walk / bisection, and end-to-end via `dtex.run` into DuckDB.
+
+## [0.9.0] — 2026-08-17
+
+### Added
+
+- **New baked source: `singular`** — Singular.net Reporting API (mobile
+  attribution). Two streams, both daily-grain, incremental on `date`,
+  `merge` on the dimensional key, fetched through the async
+  create → poll → download report flow with capped 429/5xx/network retry:
+  - `network_reports` — one row per
+    (date × app × source × os × platform × country × campaign) with
+    `adn_cost` / `adn_impressions` / `custom_clicks` / `custom_installs`
+    and Singular's attributed cohort `revenue` (period `actual`). No
+    filters — every source including organic.
+  - `agency_reports` — the same report fetched once per configured agency
+    (`agencies` param) and tagged with the agency value, because the
+    Reporting API accepts `agency_name` as a *filter* but not as a
+    *group-by* — agency membership is otherwise unrecoverable.
+
+  Windows cover (cursor − `lookback_days`, floored at
+  `initial_since_date`) → **yesterday** (today is a partial day and is
+  never fetched), sliced into `window_chunk_days` chunks — one async
+  report each, so a long backfill never rides on a single giant request.
+  The generous default lookback (30 d) exists because Singular numbers
+  restate: networks report late and cohort revenue matures after the
+  install day; `merge` upserts the corrected values in place. The cursor
+  advances once, only after every window fetched cleanly. Dimension
+  values are coerced to strings (`''` for missing) — they are merge-key
+  columns, and NULLs never match in a MERGE. Auth: `SINGULAR_API_KEY`
+  (env by default; override with a `secret://` ref per deployment). The
+  signed report `download_url` is fetched WITHOUT the auth header — some
+  object stores reject requests presenting both a query signature and an
+  `Authorization` header.
+
+## [0.8.2] — 2026-08-04
+
+### Fixed
+
+- **chargebacks911 `alerts`: full sweep instead of a fake incremental.**
+  `GET /clients/{id}/alerts` silently IGNORES
+  `date_column`/`start_date`/`end_date` — verified live, a
+  `2019-01-01`→`2019-01-02` window returns present-day alerts — and always
+  returns full account history in `id` order. The stream had been sending
+  those params anyway, so every run re-extracted the entire history while
+  the run log recorded a confident "incremental" sync: 3341 rows pulled per
+  run when only 9 rows sat past the cursor. It now sends no date params at
+  all. `merge` on `id` already made the repeat pull idempotent, so no data
+  was wrong — but the cost and the reporting were. The cursor is still
+  observed so `_dtex_state` shows real freshness.
+
+- **chargebacks911 `chargebacks`: the date window is walked in chunks.**
+  This endpoint's date filter *does* work, but CB911 503s computing wide
+  windows: three of five early production runs died on a single
+  `start_date=2023-12-25&end_date=2026-08-03` request. The span from
+  `(cursor − lookback_days)` to today is now sliced into
+  `window_chunk_days`-wide requests (default 30), each paginated and
+  retried independently, so a long catch-up after an outage completes
+  instead of failing on one un-servable request.
+
+### Added
+
+- **chargebacks911 param `window_chunk_days`** (default `30`) — max span of
+  one `chargebacks` request. Smaller means more requests but more
+  resilience.
+
+## [0.8.1] — 2026-08-03
+
+### Fixed
+
+- **chargebacks911: bootstrap without date filters.** CB911's server times
+  out (HTTP 503) computing wide `date_column` windows regardless of page
+  size, which made every first run fail. The streams no longer declare an
+  `initial_value`; a virgin run (or `--full-refresh`) now pulls the
+  unfiltered full sweep — which the server handles instantly — and
+  incremental date windows begin once cursor state exists. Verified against
+  the production API.
+
+## [0.8.0] — 2026-08-03
+
+### Added
+
+- **Baked `chargebacks911` source connector** — Chargebacks911's CBAPIv2
+  (`api.cbresponseservices.com/v2`; sandbox overridable via `base_url`). Two
+  incremental streams, both merge-on-`id` with a server-side
+  `date_column=date_updated` filter and a configurable `lookback_days`
+  overlap: `alerts` (prevention alerts — Ethoca/Verifi/RDR; camelCase
+  fields, cursor on `dateUpdated`) and `chargebacks` (chargeback cases;
+  snake_case fields, cursor on `date_updated`, nested `status_history`
+  landing as a JSON column). The client handles CB911's two-step auth —
+  Basic-auth `GET /auth` mints a ~60-minute bearer token that a NEW mint
+  invalidates — by minting lazily, proactively re-minting after ~50
+  minutes, and re-minting once on a mid-run 401. Bounded retries for 429
+  (honoring `Retry-After`), 5xx, and network errors; defensive unwrapping
+  of both the `{success, code, message, data}` envelope and the bare-list
+  responses live production sometimes returns. Credentials come from
+  `${env.CHARGEBACKS911_USERNAME}` / `${env.CHARGEBACKS911_PASSWORD}` and
+  never appear in logs or error messages.
+
+## [0.7.0] — 2026-07-25
+
+Graceful schema-drift handling: an upstream schema change (a new column, a
+removed column, or a column whose values stop matching the declared type) now
+degrades to a warning instead of failing the run. Controlled by
+`schema_drift: warn|fail` in `dtex_project.yml` (default `warn`).
+
+### Added
+
+- **Graceful schema-drift handling — a stale declared schema no longer kills
+  the run.** A live upstream source drifts: columns get added, removed, or
+  change type. Previously any of these hard-failed the stream — a declared
+  `BYTES` column that started yielding `bool` raised inside NORMALIZE and
+  failed *every* run (2026-07-24), and a new upstream column broke the load
+  with `BinderException` (DuckDB) / `Unrecognized name` (BigQuery MERGE). The
+  NORMALIZE step is now drift-tolerant, controlled by a project-level
+  `schema_drift:` setting in `dtex_project.yml`:
+  - `warn` (**the default**): a value that cannot coerce to its declared type
+    is stored as a safe fallback — `str(value)` for STRING/JSON targets, else
+    `NULL` — so the writer never sees a type-contradicting value; a declared
+    column missing from the data binds NULL; and a new undeclared column
+    appearing in any batch grows the schema, evolves the destination table,
+    and lands. Each distinct drift is logged once per `(stream, column)` (never
+    per row) as a WARNING and a structured `schema_drift` event in the run's
+    JSONL log (fields: `stream`, `column`, `kind`, `detail`; `kind` ∈
+    `type_mismatch` / `missing_column` / `new_column`).
+  - `fail`: the pre-0.6.5 strict behavior — an un-coercible value raises
+    `CoercionError` and fails the stream. New columns are still additive
+    (evolution is not a value contradiction), so a stream that only grows a
+    column succeeds even under `fail`.
+
+  Backward-compatible for library callers: `normalize_batch` still defaults to
+  the strict raise when called without a policy; only the engine's run path
+  opts into `warn`.
+
+## [0.6.4] — 2026-07-23
+
+Second half of the `--threads` concurrency fix: per-stream `commit_state`
+collided on `_dtex_state` the same way lease DML collided on `_dtex_leases`
+(0.6.3). No API or config change.
+
+### Fixed
+
+- **`commit_state` serializes its `_dtex_state` DML under `--threads`.** The
+  engine commits state once per stream (and per throttled mid-stream flush),
+  so N concurrent streams issued N MERGEs on the one `_dtex_state` table and
+  BigQuery rejected the losers (`Could not serialize access to table
+  _dtex_state due to concurrent update`). Unlike the lease hooks, state
+  commits cannot be batched across streams (streams finish at different
+  times), so the MERGE now runs under the shared connection lock — small and
+  infrequent, so contention is negligible, and a no-op on sequential runs. A
+  test models BigQuery's per-table DML serialization and fails without the
+  lock.
+
+## [0.6.3] — 2026-07-23
+
+Fixes `dtex run -p <config> --threads N` on BigQuery: per-stream lease DML
+collided on the single `_dtex_leases` table (BigQuery serializes DML per
+table), failing concurrent streams with "Could not serialize access". Lease
+acquire/heartbeat/release are now batched into one statement over the whole
+stream set, driven main-thread-only. No API or config change.
+
+### Fixed
+
+- **Batched lease DML — stream parallelism no longer collides on `_dtex_leases`.**
+  Leasing (0.5.0) issued one MERGE/UPDATE per stream; stream parallelism (0.6.0)
+  ran N streams at once, so N lease statements hit the one lease table
+  concurrently and BigQuery rejected the losers (`Could not serialize access to
+  table _dtex_leases due to concurrent update`), taking down a `--threads` run.
+  The three mutating lease hooks are now batched (`acquire_leases` /
+  `heartbeat_leases` / `release_leases`), each a single statement over the whole
+  candidate set, issued from the engine's main thread while worker threads run
+  streams. A test models BigQuery's per-table DML serialization (raises if two
+  lease statements overlap) so this class of bug fails in CI, not prod. DuckDB
+  batches in one transaction (it is single-writer regardless). Fully
+  backward-compatible.
+
+## [0.6.2] — 2026-07-23
+
+Fixes a CLI crash that turned a successful run into a failure the first time a
+stream was actually leased-skipped. No API or config change.
+
+### Fixed
+
+- **`StreamStatus.SKIPPED_LEASED` no longer crashes the run summary.** The
+  per-status glyph table (`_STREAM_MARK`) never got an entry for the
+  `SKIPPED_LEASED` status added in 0.5.0, so `print_run_result` raised
+  `KeyError: SKIPPED_LEASED` the first time a run actually skipped a
+  leased-elsewhere stream — *after* the sync had done its work, turning a
+  green run red. Added the missing entry and routed the lookup through a
+  `_mark_for` accessor that falls back to the status name instead of raising,
+  so a status added to the enum in future can never again fail a run purely on
+  the display line. A test now walks every `StreamStatus` member through the
+  render path.
+
+## [0.6.1] — 2026-07-23
+
+### Fixed
+
+- **BigQuery merge: evolve the TARGET table for batch-only columns.** A merge
+  batch carrying a column beyond the declared stream schema (the `evolve`
+  default) evolved only the per-batch staging table; the MERGE — which
+  references every schema column — then failed against the target with
+  `400 Unrecognized name: <column>`, wedging the stream until the column was
+  added by hand. `_merge_via_staging` now runs `_ensure_load_target` on the
+  target before merging, mirroring the staging path. (Hit in production when
+  a new `cello_ucc` column appeared on an upstream table.)
+
+## [0.6.0] — 2026-07-22
+
+Adds intra-config stream parallelism: `dtex run -p <config> --threads N` now
+runs a single config's streams concurrently (previously `--threads` only
+applied to `--tag`). Backward-compatible — unset or `1` is the prior
+sequential behavior.
+
+### Added
+
+- **Stream-level parallelism for `dtex run -p <config> --threads N`.**
+  `--threads` previously applied only to `--tag` (running whole configs
+  concurrently) and was ignored with `-p`; a single config always ran its
+  streams sequentially. Now `-p … --threads N` runs up to N of the config's
+  streams concurrently via a thread pool, clamped down by the destination's
+  `@destination.max_concurrent_writes` — so BigQuery parallelizes (default
+  cap 10) while DuckDB stays serial (cap 1, its single shared connection
+  can't take concurrent writers). Failure and ordering semantics are
+  unchanged: one stream failing fails the whole run, in-flight streams finish
+  (queued ones are cancelled), and the returned `streams` list is always in
+  declared order regardless of completion order. Fully backward-compatible —
+  `--threads` unset or `1` runs streams sequentially exactly as before. The
+  engine's shared per-run destination state (the `_dtex_*` create-once flags,
+  the replace-truncate guard) and the lease coordinator's bookkeeping are now
+  lock-guarded so concurrent streams stay correct; `active_stream` log tagging
+  is left unset in parallel mode (every JSONL event already carries an
+  explicit `stream=` field).
+
+## [0.5.1] — 2026-07-21
+
+Fixes a state-durability bug that let an interrupted `append`-mode bootstrap
+re-append duplicate rows on restart (root cause of a large CockroachDB
+duplication incident). No API or config change.
+
+### Fixed
+
+- **An interrupted stream no longer loses its in-progress state (and, for an
+  `append` stream, no longer re-appends duplicates on restart).** State was
+  committed only once, after a stream's batch loop finished, so a build that
+  timed out, was cancelled, or crashed mid-stream lost every mid-stream
+  `state.set(...)` the connector had made — most critically a bootstrap's
+  resume pointer. The next run then resumed from the last *persisted* pointer,
+  far behind where it had actually written, and an `append` stream re-appended
+  the whole overlap as duplicate rows (this produced ~72M duplicates in a
+  118M-row CockroachDB bootstrap). The engine now flushes state periodically
+  during the batch loop — always *after* a batch's rows are durable
+  (commit-after-write ordering) and throttled to at most one write per
+  `STATE_COMMIT_INTERVAL_SECONDS` (60s) so a fast many-batch stream does not
+  pay a state write per batch. Worst-case re-append on a crash drops from
+  "everything since the last full-stream commit" to "at most one batch", which
+  the destination's primary-key dedup absorbs. Fully backward-compatible: the
+  final end-of-stream commit still runs, a `FULL_REFRESH`-this-run incremental
+  stream still writes no state, and a destination without a `commit_state`
+  hook still commits nothing.
+
+## [0.5.0] — 2026-07-20
+
+Adds stream-level run leasing so a long-running stream (e.g. a multi-hour
+bootstrap of a huge table) no longer blocks the rest of a source's schedule,
+plus a `partition_by: none` opt-out for the cursor auto-default. Also fixes a
+BigQuery GCS-upload timeout on wide-row batches. All changes are
+backward-compatible: a project that sets nothing new behaves exactly as on
+0.4.0.
+
+### Added
+
+- **Stream-level run leasing — non-blocking parallel syncs.** A long-running
+  stream (e.g. a multi-hour bootstrap of a huge table) no longer blocks every
+  other stream's schedule. A destination that declares the new
+  `Capability.LEASE` (BigQuery and DuckDB now do) hosts a `_dtex_leases`
+  table; the engine leases each stream before running it. A stream already
+  held by a *live* lease from another concurrent build is skipped as the new
+  `StreamStatus.SKIPPED_LEASED` (a cooperative skip — the run still
+  succeeds) instead of double-run, and the build runs the rest. Leases carry
+  a heartbeat refreshed between batches; a lease whose heartbeat goes stale
+  (default 15 min — a crashed holder) is reclaimable, so a dead build never
+  blocks a stream forever. A per-source `concurrency: {<source>: N}` cap in
+  `dtex_project.yml` bounds how many streams one build leases at once
+  (leasing itself is the correctness floor — a stream never double-runs
+  regardless of the cap). Fully backward-compatible: a destination without
+  `Capability.LEASE`, or a project with no `concurrency:` key, behaves
+  exactly as before (sequential, no lease table, no coordination).
+
+- **`partition_by: none` — explicit partitioning opt-out.** A timestamp- or
+  date-cursor stream is auto-promoted to TIME/DAY partitioning on the cursor
+  column; there was no way to refuse. That default is hazardous for
+  backfill-heavy streams: a bootstrap sweep writes the whole table history
+  into every batch, each load touches hundreds of day-partitions, and
+  BigQuery's partition-modification quota (5,000/day/table) fails the run.
+  `partition_by: none` (register.yaml) and `partition: none` (per-stream
+  config override) now resolve to "explicitly unpartitioned" and suppress
+  the auto-default. The cockroachdb connector README documents when to
+  choose `none` vs `{type: ingestion}` for large first syncs.
+
+### Fixed
+
+- **BigQuery GCS staging uploads use chunked resumable transfer.** The
+  staging Parquet blob was uploaded single-shot with the SDK's default
+  60-second timeout; a wide-row batch serializing to hundreds of MB timed
+  out on every attempt on slower uplinks. Uploads now set an 8 MiB
+  `chunk_size` (resumable protocol, per-chunk timeout) and inherit the
+  destination's `job_timeout_seconds`.
+
+## [0.4.0] — 2026-07-17
+
+Adds `cockroachdb` — a baked CockroachDB source connector built for the
+realities of Cockroach Cloud: primary-key-keyset bootstrap that stays inside
+fixed SQL memory budgets at any table size, resumable page-capped first
+syncs, `AS OF SYSTEM TIME` follower reads, and hidden-column (`crdb_region`)
+handling for REGIONAL BY ROW tables. Verified end-to-end against a live
+Cockroach Cloud Standard cluster, including tables in the hundred-million-row
+range. Also fixes two BigQuery load-path defects the live verification
+surfaced.
+
+### Fixed
+
+- **BigQuery loads work for streams with `JSON` fields.** The LOAD job
+  carried an inline schema, and BigQuery rejects `JSON` fields there
+  (`400 Unsupported field type: JSON`); schema-less Parquet loads then
+  type-mismatch against native JSON columns too. Stream tables now declare
+  `JSON` fields as `STRING` columns carrying JSON text (the same shape
+  Airbyte/Fivetran land `jsonb` as; the internal `_dtex_state` /
+  `_dtex_runs` tables keep native JSON — they are written via
+  parameterized DML, where it works). The load path was reworked
+  alongside: the destination creates/patches the load target (including
+  per-batch merge staging tables) through the tables API first and runs
+  the LOAD without an inline schema, mapping Parquet columns to the table
+  by name; the Parquet file carries per-field nullability so `REQUIRED`
+  columns survive the round-trip; `WRITE_TRUNCATE` dispositions became an
+  explicit `TRUNCATE TABLE` + append-load (a schema-less truncate-load
+  would have replaced the table schema with the Parquet-inferred one);
+  and merge staging loads became plain appends into their freshly-created
+  per-batch tables.
+- **`FLOAT` normalization accepts `decimal.Decimal`.** Postgres-protocol
+  drivers (psycopg — the `postgres` and `cockroachdb` sources) yield
+  `Decimal` for `NUMERIC`/`DECIMAL` columns; normalize previously raised
+  `CoercionError` on the first such value. A `Decimal` now coerces through
+  `float()` like `int` does.
+
+### Added
+
+- **`cockroachdb` baked source connector.** CockroachDB over the Postgres
+  wire protocol (`psycopg`), shaped like the `postgres` source but built for
+  CockroachDB's extraction realities. The first sync of an incremental
+  stream sweeps the table by **primary-key keyset** (`WHERE (pk...) > (...)
+  ORDER BY pk LIMIT n`) instead of cursor order — every page a constrained
+  index scan, safe on Cockroach Cloud's fixed per-tenant SQL memory budget
+  where an unbounded `ORDER BY cursor_field` dies with "memory budget
+  exceeded". Bootstrap progress (last PK, running cursor max) persists in
+  stream state, so an interrupted or page-capped sweep (`bootstrap_max_pages`)
+  resumes instead of restarting, and the cursor handed to the engine on
+  completion is the true global max. Steady-state incremental runs use the
+  same cursor keyset as `postgres`. Reads can be pinned with
+  `AS OF SYSTEM TIME` (`as_of_system_time` param; e.g.
+  `follower_read_timestamp()`) for contention-free follower reads. Cockroach
+  Cloud plumbing: `sslmode` defaults to `verify-full` with
+  `sslrootcert=system` (public-CA certs), `options` passes `--cluster=`
+  routing for non-SNI clients. Type mapping extends the Postgres set with
+  the shapes CockroachDB's `information_schema` emits: `ARRAY` → `JSON`,
+  `USER-DEFINED` (enums, incl. `crdb_region`) → `STRING`, `inet` /
+  `interval` / the `time` family → `STRING`, `oid` → `INTEGER`.
+
+## [0.3.1] — 2026-06-16
+
+Hygiene patch — removes example text that named a specific account from
+the packaged docs and tests. No behavior, API, or connector change.
+
+### Changed
+
+- **Generic example wording in `revenuecat`'s README and a config test.**
+  Replaced a customer-specific example reference with neutral phrasing.
+  Packaging-only; nothing about the connectors or the engine changes.
+
+## [0.3.0] — 2026-06-15
+
+Adds `gads` — a baked Google Ads source connector built on GAQL (the
+Google Ads Query Language). Each stream is a GAQL query submitted to the
+`searchStream` endpoint, the same query-as-stream shape the `stripe`
+connector uses for Sigma SQL. Ships five streams (campaigns + per-campaign,
+per-ad-group, per-ad, and per-keyword daily stats), runtime OAuth2 token
+minting with a one-time refresh-token helper, and MCC account
+auto-discovery. Verified end-to-end against the live Google Ads API.
+
+### Added
+
+- **`gads` baked source connector.** Google Ads API v24 over REST, GAQL
+  as the single extraction surface. Streams: `campaigns` (entity list,
+  full replace) and `campaign_daily_stats` / `ad_group_daily_stats` /
+  `ad_daily_stats` / `keyword_daily_stats` (incremental on `segments.date`
+  with a lookback window that re-pulls recent days to absorb late
+  conversions and attribution restatements). Nested `GoogleAdsRow`
+  responses are flattened to snake_case columns; money stays in micros.
+  See the [connector README](https://github.com/vej-ai/dtex/blob/main/dtex/sources/gads/README.md).
+
+- **Google Ads OAuth refresh-token helper.** `python -m
+  dtex.sources.gads.scripts.get_refresh_token` runs the one-time loopback
+  OAuth consent flow and writes the refresh token to a git-ignored file
+  (mode 0600), so the secret never lands in terminal scrollback. The
+  connector mints short-lived access tokens from it at run time.
+
+- **MCC account auto-discovery.** Leave `customer_ids` empty and set
+  `auto_discover_from_manager` to a manager (MCC) id; the connector
+  expands the manager's tree via the `customer_client` resource and pulls
+  every ENABLED, non-manager (leaf) account under it, up to
+  `max_discovery_depth` (default 1). An explicit `customer_ids` always
+  wins; the manager id doubles as `login_customer_id` automatically.
+
+- **`GaqlConfig` SDK type.** A new public contract type
+  (`dtex.GaqlConfig`) and a `StreamDef.gaql` field, mirroring the existing
+  `SigmaConfig`/`StreamDef.sigma`. Marks a stream as GAQL-driven and names
+  its `.gaql` query file. Purely additive — existing connectors and
+  manifests are unaffected.
+
+## [0.2.4] — 2026-06-10
+
+Documentation-only patch release. The "Pre-baked connectors" section
+in the main README was getting unwieldy as more connectors shipped
+(6 sources, 2 destinations) — restructured to a compact table of
+per-connector READMEs so adding a new connector is one row, not a
+prose update. Also adds the missing DuckDB destination README.
+
+### Changed
+
+- **Main README "Pre-baked connectors" section restructured.** Replaced
+  the inline-prose list with two compact tables (sources + destinations)
+  linking to each connector's own README. Operator-friendly format for
+  "show me what's available + tell me more." Same authoring story for
+  every future connector — add one row, no prose churn.
+
+### Added
+
+- **DuckDB destination README.** Every other baked connector ships
+  with its own README; DuckDB was the only gap. Covers install +
+  config + the five capabilities + state/run-records semantics + the
+  concurrent-write caveat. No behavior change — DuckDB just gets the
+  same doc surface every other connector has.
+
+## [0.2.3] — 2026-06-10
+
+A patch release adding `revenuecat` as a baked source connector — the v2
+API across customers, subscriptions, and daily chart metrics. The
+metrics_daily stream uses RC's own `incomplete=true` flag to handle the
+partial-today caveat without bespoke lookback heuristics.
+
+### Added
+
+- **Baked `revenuecat` source connector for the v2 API.** Three streams:
+  - **`customers`** — every customer in the project. NON-incremental:
+    RC v2 has no server-side date filter on /customers (verified against
+    the docs + airbyte issue 70315 + RC community forum). Every run
+    paginates the full customer list. `write_disposition: merge` on `id`
+    makes re-pulls upsert idempotently. For a ~200k-customer account
+    expect ~70 minutes wall at the default page_size against RC's
+    480-req/min Customer Information rate limit.
+  - **`subscriptions`** — per-customer fan-out: RC has no project-level
+    /subscriptions endpoint, only /customers/{id}/subscriptions. O(N+1)
+    HTTP calls per run for N customers.
+  - **`metrics_daily`** — RC v2's Charts API takes server-side
+    `start_date`/`end_date` filters and tags per-day values with
+    `incomplete=true` when finalizing. Long-format output
+    (`cohort_date × chart_name × measure_name`) — adding a new chart
+    needs zero schema migration. The cursor advances only past days
+    RC marked complete, so partial-today re-pulls cleanly on the
+    next run with the corrected (final) value.
+
+  Default charts are `revenue,mrr,actives,trials` — the four that
+  return the standard `{cohort, incomplete, measure, value}` shape.
+  `cohort_explorer` and `prediction_explorer` return a different shape
+  and would break the flattener; they're excluded.
+
+  Auth via the `REVENUECAT_API_KEY` env var by default (any
+  resolver-backed `secret://` ref works in a profile). The client uses
+  a bounded `(10s connect, 60s read)` timeout, retries on
+  `requests.exceptions.RequestException` family + 5xx + 429 (all
+  capped by `max_retries` — the 429 path explicitly bounded to avoid
+  the infinite-loop hang the prior project-local version had).
+
+  Verified live: 195,200-customer backfill, ~71 min wall, clean run.
+
+## [0.2.2] — 2026-06-09
+
+A patch release. BigQuery destination is now robust against the
+stale-TCP-socket failures that long-running runs (hundreds of
+sequential LOAD jobs over an hour-plus) routinely hit. Plus the
+README finally mentions the bundled Claude skills feature that has
+shipped since 0.2.0.
+
+### Fixed
+
+- **BigQuery destination: retry on statusless network failures.**
+  `run_with_retries` only retried when the exception carried an
+  HTTP status code in `_RETRYABLE_STATUS` (429/5xx). A connection-
+  level failure — `requests.exceptions.ConnectionError` wrapping
+  `http.client.RemoteDisconnected` from a stale keep-alive socket —
+  has no `.code` attribute, so the retry path re-raised on the
+  first attempt and the whole stream aborted. This was latent in
+  every prior release; it surfaced reliably during a 73-minute
+  RevenueCat customers backfill (300+ sequential MERGE-via-staging
+  LOAD jobs against a single connector instance). The fix adds
+  `_is_retryable_network_error` recognising concrete network-class
+  exception types (`ConnectionError`, `Timeout`,
+  `ChunkedEncodingError`, `google.api_core.exceptions.RetryError`);
+  programming errors without a status code (`KeyError`, `TypeError`)
+  still surface on the first attempt — the broadened catch is
+  precisely typed, not "any statusless exception."
+
+### Changed
+
+- **README mentions the bundled Claude skills feature.** Skills
+  shipped in 0.2.0 but were undiscoverable from the PyPI project
+  page or the GitHub repo README. Adds a "Bundled Claude skills"
+  section between the connector inventory and the docs link, plus
+  updates the stripe one-liner to mention the Sigma surface added
+  in 0.2.1. Documentation-only — no behavior change. Skills users
+  who installed 0.2.0/0.2.1 already have the feature working.
+
+## [0.2.1] — 2026-06-04
+
+A patch release that lands Stripe Sigma SQL-as-stream extraction inside
+the existing `stripe` connector, with a new `stream_def` injectable on
+`@stream` functions that makes the dual-surface dispatch clean.
+
+### Added
+
+- **Stripe Sigma SQL-as-stream folded into the `stripe` connector.** One
+  baked connector, two extraction surfaces: REST (default) and Sigma SQL
+  (opt-in per stream via a new `sigma: {query: <path>}` block in
+  `register.yaml`). The shipped Sigma streams (`charges_daily`,
+  `subscriptions_active`, `invoices_paid`) each reference a `.sql` file
+  under `dtex/sources/stripe/queries/`; the connector submits the SQL via
+  Stripe's async Query Run API (`POST /v2/data/reporting/query_runs`),
+  polls, downloads the CSV result, and yields batches of dicts.
+
+  The CSV is downloaded to a temp file in one continuous pass rather than
+  parsed straight off the socket — the engine pulls batches lazily and
+  loads each into the destination before requesting the next, so
+  socket-side parsing would leave the download connection idle for the
+  duration of every load job and Stripe's CDN would close it mid-body on
+  large results (`ChunkedEncodingError: IncompleteRead`). Draining the
+  socket up front decouples download speed from load pace; a dropped
+  download retries from scratch up to `max_retries` with the same
+  exponential backoff as the submit/poll calls, and is duplicate-free for
+  `replace`/`merge` streams since no rows are yielded until the full CSV
+  is in hand.
+
+  A single Stripe restricted key with both REST + Sigma+Reporting scopes
+  drives both surfaces; the merged connector reads it from `STRIPE_API_KEY`
+  by default (any resolver-backed `secret://` ref also works). REST streams
+  are unchanged from the prior `stripe` connector — same names, same schema,
+  same `cursor_type: int`. Existing configs continue to work; configs that
+  want Sigma data declare the corresponding stream in their `streams:` block.
+
+- **`stream_def` is now an engine-injected parameter on `@stream` functions.**
+  A connector can introspect its own `StreamDef` declaration — e.g. the
+  merged `stripe` connector dispatches to Sigma extraction when
+  `stream_def.sigma is not None`, reading the SQL filename from the
+  `sigma:` block in `register.yaml`. New injectable, alongside the existing
+  `config` / `state` / `cursor` / `log`. No existing function signatures
+  change; declare `stream_def` only when you need it.
+
+### Changed
+
+- **`stripe` connector version bumped to 2.0.0.** The REST half is unchanged
+  but the connector now also serves Sigma streams. The standalone
+  `stripe_sigma` source connector (briefly developed during 0.2.0 dev but
+  never released as a separate package) is removed in favor of the merged
+  shape — anyone iterating on that standalone version should switch their
+  config from `source: stripe_sigma` to `source: stripe`.
+
+## [0.2.0] — 2026-06-03
+
+A breaking release. The config schema gained a mandatory `streams:` block
+that subsumes the prior `select:` and `partition_overrides:` keys (both
+hard-removed). `--full-refresh` no longer resets state. Every existing
+config needs a `streams:` line — `streams: all` matches the prior
+default behavior.
+
+### Added
+
+- **`dtex init --with <destination>`** scaffolds a starter `profiles.yml`
+  block for a baked destination alongside the always-scaffolded `duckdb`
+  block. Repeatable: `dtex init --with bigquery --with duckdb`. Unknown
+  names fail with a clean error listing the valid options. New users no
+  longer have to copy a BigQuery block out of the docs to get started.
+
+- **BigQuery destination: new `auth_type` param.** Two modes —
+  `oauth` (default; uses Application Default Credentials, no path
+  needed) and `service_account` (requires a non-empty `credentials_path`
+  pointing at the JSON key). The scaffolded BigQuery block no longer
+  includes an empty `credentials_path:` field, which was confusing — the
+  oauth path has no path to set.
+
+- **Mandatory per-pipeline `streams:` block, with per-stream overrides.**
+  Every config now declares which streams the pipeline runs and how.
+  Two shapes: `streams: all` (the explicit catch-all opt-in — runs every
+  stream the source declares) and `streams: {<stream_name>: {...}}` (an
+  explicit mapping with optional per-stream `mode`, `since`, `params`,
+  and `partition` overrides). A typo in a stream name is a hard error
+  listing the valid streams; setting `mode: incremental` on a stream
+  whose source declares no cursor is a hard error. The block subsumes
+  the prior `select:` and `partition_overrides:` keys — both of which
+  are now removed (see *Removed* below).
+
+  The new design recognizes that a config is the pipeline blueprint, not
+  the schema. Stream identity (cursor, primary key, schema, extraction
+  logic) stays in `register.yaml`; the per-pipeline shape (which streams,
+  what mode, what params, what partition) lives in the config. This lets
+  a `dev` config run one stream as `full_refresh` while a sibling `prod`
+  config keeps it incremental, without forking the source. See
+  [docs/12 §3.1](https://github.com/vej-ai/dtex/blob/main/docs/12-configs.md)
+  for the full surface and the per-stream knob reference.
+
+- **Per-stream source-param overlay (precedence layer 4).** A config's
+  `streams[<name>].params:` block sits between the config's top-level
+  `params:` (layer 3) and the env-var layer (layer 5). Lets one stream
+  use a different `page_size` than the others without bumping the
+  default for the whole pipeline.
+
+- **Bundled Claude skills + `dtex skills install` + first-run hint.**
+  Three skill files ship inside the wheel at `dtex/skills/*.md` —
+  `dtex-write-config.md`, `dtex-write-connector.md`, and
+  `dtex-debug.md`. `dtex skills install [DIRECTORY]` copies them into
+  `<DIRECTORY>/.claude/skills/dtex/` (default DIRECTORY is `.`), with
+  `--force` for re-installs. Any `dtex` command run inside a project
+  that lacks installed skills AND hasn't yet been prompted emits a
+  single-line stderr hint pointing at the install command — fires once,
+  suppressed by a `.dtex/skills-prompted` marker, and silenced
+  entirely for `dtex skills *` invocations. Skills are discovered at
+  runtime via `importlib.resources`, so the mechanism works for
+  wheels, sdists, editable installs, and zipped envs.
+
+### Changed
+
+- **BigQuery destination: `auth_type` is authoritative.** With
+  `auth_type=oauth` any value in `credentials_path` is ignored (ADC
+  always wins). With `auth_type=service_account` a missing
+  `credentials_path` fails with a clear message at `open()` time. An
+  unknown `auth_type` fails listing the valid options.
+
+- **`--full-refresh` no longer resets `_dtex_state`.** The new rule
+  (docs/12 §3.1): a full-refresh run does NOT read, advance, or
+  reset the cursor row. The prior cursor stays intact, so a sibling
+  incremental config sharing this source keeps its cursor. To actually
+  clear state, use `dtex state reset <stream>` — that operation is
+  unchanged. This is technically a behavior change to an existing
+  flag; it matches the new per-stream `mode: full_refresh` semantics
+  and was the only safe default given that state is source-keyed
+  (multiple configs share the same `_dtex_state` row).
+
+- **`--select` narrows the config's `streams:` block.** Previously it
+  *replaced* the config's `select:` list. Now `--select` is an
+  intersection: a `--select` name that isn't in the config's
+  `streams:` block is a hard error listing the in-scope names. You
+  can't materialize a stream the pipeline blueprint doesn't list.
+
+- **`dtex list` shows a `STREAMS` column** (was `SELECT`).
+  `(all)` for `streams: all`, comma-separated names for an explicit
+  mapping.
+
+- **Scaffolded config templates teach the new schema.** Both
+  `_CONFIG_YML` (`dtex new config`) and `_EXAMPLE_CONFIG_YML` (the
+  example seeded by `dtex init`) now declare `streams:` explicitly,
+  with commented examples of the per-stream override forms.
+  `dtex new source` adds a comment to the source template noting
+  that the example config references streams via `streams: all`,
+  so renaming streams is safe.
+
+- **New acceptance test `test_scaffold_chain_validates_clean`** runs
+  `init` → `new source` → `new config` → `validate` end-to-end and
+  asserts exit-zero. Catches the class of bugs where a template
+  drifts from the parser's schema.
+
+### Removed
+
+- **`select:` config key.** Subsumed by `streams:` (a listed stream
+  is automatically selected). Parsing a config with `select:` fails
+  with a friendly error pointing at the new location.
+
+- **`partition_overrides:` config key.** Subsumed by
+  `streams[<name>].partition`. Same friendly redirect on parse.
+
+## [0.1.5] — 2026-06-01
+
+### Added
+- **Engine NORMALIZE step now coerces values to declared schema types.**
+  The docs have always described the engine's pipeline as
+  "extract → normalize → load" with per-type value coercion as the engine's
+  job. In practice the engine only did *schema* normalization (declared vs
+  inferred; strict vs evolve) and passed dicts through to the destination
+  unchanged — a connector yielding all-string records (a CSV-backed source
+  like the Stripe Sigma connector) crashed the BigQuery destination with
+  `ArrowInvalid: Could not convert '1599' with type str: tried to convert
+  to int64`. The fix lives in the engine as a new
+  `dtex.engine.normalize.coerce_value` / `normalize_batch` pair: every cell
+  in every batch is coerced to the canonical Python representation of its
+  declared `FieldType` before reaching `write_batch`. Per-type rules cover
+  the common alternate input shapes (digit strings → `INTEGER`,
+  `true`/`false`/`yes`/`no`/`1`/`0` → `BOOLEAN`, ISO-8601 / Unix-epoch →
+  tz-aware UTC `datetime`, base64 / utf-8 → `BYTES`, etc.). Empty string
+  becomes `None` for non-`STRING` types (the CSV "no value" idiom).
+  Uncoercible values raise the new `dtex.CoercionError` (a `ValueError`
+  subclass) naming the column, value, source type, and target
+  `FieldType` — and roll back the partial load via the destination's
+  `transaction` hook. Connectors that already yield canonical Python
+  types see zero behavior change. Destinations no longer need per-
+  destination coercion: by the time they see a batch, every cell is the
+  type their writer expects. See [docs/02 §The extract → normalize → load
+  pipeline](./docs/02-architecture.md#the-extract--normalize--load-pipeline)
+  for the per-FieldType coercion table.
+
+## [0.1.4] — 2026-05-29
+
+### Fixed
+- **Secret-resolver errors now include the SDK's actual message.** Previously,
+  catch-all branches in the GCP, AWS, and Vault resolvers surfaced only the
+  exception class name (e.g. `RetryError`, `_FakeClientError`,
+  `_FakeForbidden`) — defensive paranoia that the SDK message body might
+  leak secret-adjacent metadata. In practice the SDK has not yet received
+  the secret value at the point those exceptions raise, so the message
+  bodies carry only operator-diagnostic text ("Reauthentication is needed",
+  "permission denied", "Could not connect to the endpoint URL", etc.).
+  Operators were left to manually debug 57-second hangs with no actionable
+  output. The engine's per-run Redactor remains the safety net for any
+  value that does slip into a log line.
+
+## [0.1.3] — 2026-05-28
+
+### Added
+- **Multi-file project-local connectors.** A project-local connector folder
+  may split helpers into sibling files (`client.py`, `helpers.py`, etc.) and
+  use relative imports like `from .client import SigmaClient` in `source.py`
+  / `destination.py`. Previously failed with `ImportError: attempted relative
+  import with no known parent package` because the engine loaded each `.py`
+  as a standalone module. The engine now loads a connector folder as a
+  synthetic Python package; the existing baked connectors are unaffected.
+- **Scaffolds emit `__init__.py`.** `dtex new source <name>` and
+  `dtex new destination <name>` now write an empty `__init__.py` to make
+  the package shape explicit. Folders without one still work via PEP 420
+  namespace packages — fully backward-compatible.
+- GitHub Actions CI: pytest matrix on Python 3.11/3.12/3.13, ruff + mypy lint.
+- PyPI Trusted Publishing workflow triggered by `v*` tags.
+
+## [0.1.2] — 2026-05-27
+
+### Fixed
+- `dtex --version` reported `0.1.0` regardless of the installed version
+  because `dtex/__init__.py` hardcoded the version string and drifted from
+  `pyproject.toml`'s `[project] version`. `__version__` is now read from
+  the installed-package metadata via `importlib.metadata` — one source of
+  truth, no drift possible.
+
+The 0.1.1 release on PyPI is yanked alongside 0.1.0; install `dtex==0.1.2`
+or later for an accurate `--version` output.
+
+## [0.1.1] — 2026-05-27
+
+### Fixed
+- README links rendered as broken on the PyPI project page. PyPI does not
+  resolve relative paths against a base URL the way GitHub does, so the
+  Documentation / Security / Contributing / Code of Conduct / Changelog /
+  LICENSE links pointed at nothing. All converted to absolute
+  `https://github.com/vej-ai/dtex/...` URLs.
+
+The 0.1.0 release on PyPI is yanked; install `dtex==0.1.1` or later.
+
+## [0.1.0] — 2026-05-27
+
+The first public release.
+
+### Added
+
+- **Engine.** Run lifecycle with discovery, config resolution, per-stream
+  commit, transactional loads with rollback-on-failure, schema evolution
+  (`evolve` default, `strict` opt-in), structured JSON-lines logs per run,
+  a `_dtex_runs` audit table, and pipeline-level parallel execution with
+  per-destination concurrency caps.
+- **CLI** (`dtex`): `run`, `list`, `validate`, `init`, `new` (source /
+  destination / config), `state`, `runs`, `secrets test`.
+- **Library API.** `dtex.run(config=...)` as the engine entry point;
+  `@stream`, `@resource`, `@destination`, `Connector`, `stream_method`,
+  and the contract types (`Capability`, `Schema`, `Field`, `Config`,
+  `State`, `Cursor`, `Batch`, `StateRecord`) for connector authors.
+- **Project layout.** dbt-style `dtex_project.yml` + `profiles.yml`, with
+  pipelines defined as configs under `configs/`. `dtex init` scaffolds
+  the layout; `dtex new` scaffolds individual sources, destinations, and
+  configs.
+- **Baked source connectors.** `filesystem` (CSV / JSONL / Parquet from
+  local, GCS, or S3 with `[gcs]` / `[s3]` extras), `rest` (paginated
+  REST APIs — four pagination strategies, four auth modes), `postgres`
+  (keyset pagination, no `OFFSET`), `shiphero` (GraphQL), `stripe`
+  (resource-as-stream over the REST API).
+- **Baked destination connectors.** `duckdb` (zero-config dev default,
+  all five capabilities) and `bigquery` (production warehouse — Parquet
+  staging via GCS plus `LOAD` jobs, `MERGE` upserts, smart cursor-based
+  partitioning).
+- **State and run records.** Engine state lives in the destination's
+  `_dtex_state` table alongside the data it tracks; per-run audit lives
+  in `_dtex_runs`.
+- **Secret-manager resolvers.** Pluggable `secret://<scheme>/<path>` URL
+  form plus three production resolvers — GCP Secret Manager
+  (`dtex[gcp-secrets]`), AWS Secrets Manager (`dtex[aws-secrets]`), and
+  HashiCorp Vault (`dtex[vault]`) — each opt-in via extras. Custom
+  resolvers register via entry-point or a project-local
+  `dtex_plugins.py`.
+
+### Security
+
+- **Redaction filter.** Secrets declared with `secret: true` in
+  `register.yaml`, and any value resolved via `${env.X}` or `secret://`,
+  are redacted to `***` in stdout, `.dtex/logs/`, run records,
+  `--dry-run` config dumps, and exception messages. Redaction is by
+  value, not just by key.
+- **Trust model.** The threat model for running third-party connector
+  code in-process is documented in
+  [`docs/08-security.md`](./docs/08-security.md). dtex does not sandbox
+  connector code in v1; the provenance / least-privilege guidance is
+  spelled out so operators can plan accordingly.
+- **Fresh-every-run secret resolution.** No on-disk cache of resolved
+  secret values. The per-process resolver client is reused across calls
+  within a single run, but every value is re-fetched on every run.
+- **Vulnerability reporting.** [`SECURITY.md`](./SECURITY.md) documents
+  the private-disclosure channel and response timelines.
+
+[Unreleased]: https://github.com/vej-ai/dtex/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/vej-ai/dtex/releases/tag/v0.20.1
+[0.20.0]: https://github.com/vej-ai/dtex/releases/tag/v0.20.0
+[0.19.0]: https://github.com/vej-ai/dtex/releases/tag/v0.19.0
+[0.18.0]: https://github.com/vej-ai/dtex/releases/tag/v0.18.0
+[0.17.0]: https://github.com/vej-ai/dtex/releases/tag/v0.17.0
+[0.16.1]: https://github.com/vej-ai/dtex/releases/tag/v0.16.1
+[0.16.0]: https://github.com/vej-ai/dtex/releases/tag/v0.16.0
+[0.15.0]: https://github.com/vej-ai/dtex/releases/tag/v0.15.0
+[0.14.4]: https://github.com/vej-ai/dtex/releases/tag/v0.14.4
+[0.14.3]: https://github.com/vej-ai/dtex/releases/tag/v0.14.3
+[0.14.2]: https://github.com/vej-ai/dtex/releases/tag/v0.14.2
+[0.14.1]: https://github.com/vej-ai/dtex/releases/tag/v0.14.1
+[0.14.0]: https://github.com/vej-ai/dtex/releases/tag/v0.14.0
+[0.13.0]: https://pypi.org/project/dtex/0.13.0/
+[0.12.7]: https://github.com/vej-ai/dtex/releases/tag/v0.12.7
+[0.12.6]: https://github.com/vej-ai/dtex/releases/tag/v0.12.6
+[0.12.5]: https://github.com/vej-ai/dtex/releases/tag/v0.12.5
+[0.12.4]: https://github.com/vej-ai/dtex/releases/tag/v0.12.4
+[0.12.3]: https://github.com/vej-ai/dtex/releases/tag/v0.12.3
+[0.12.2]: https://github.com/vej-ai/dtex/releases/tag/v0.12.2
+[0.12.1]: https://github.com/vej-ai/dtex/releases/tag/v0.12.1
+[0.12.0]: https://github.com/vej-ai/dtex/releases/tag/v0.12.0
+[0.11.0]: https://github.com/vej-ai/dtex/releases/tag/v0.11.0
+[0.10.2]: https://github.com/vej-ai/dtex/releases/tag/v0.10.2
+[0.10.1]: https://github.com/vej-ai/dtex/releases/tag/v0.10.1
+[0.10.0]: https://github.com/vej-ai/dtex/releases/tag/v0.10.0
+[0.9.0]: https://github.com/vej-ai/dtex/releases/tag/v0.9.0
+[0.8.2]: https://github.com/vej-ai/dtex/releases/tag/v0.8.2
+[0.8.1]: https://github.com/vej-ai/dtex/releases/tag/v0.8.1
+[0.8.0]: https://github.com/vej-ai/dtex/releases/tag/v0.8.0
+[0.7.0]: https://github.com/vej-ai/dtex/releases/tag/v0.7.0
+[0.6.4]: https://github.com/vej-ai/dtex/releases/tag/v0.6.4
+[0.6.3]: https://github.com/vej-ai/dtex/releases/tag/v0.6.3
+[0.6.2]: https://github.com/vej-ai/dtex/releases/tag/v0.6.2
+[0.6.1]: https://github.com/vej-ai/dtex/releases/tag/v0.6.1
+[0.6.0]: https://github.com/vej-ai/dtex/releases/tag/v0.6.0
+[0.5.1]: https://github.com/vej-ai/dtex/releases/tag/v0.5.1
+[0.5.0]: https://github.com/vej-ai/dtex/releases/tag/v0.5.0
+[0.4.0]: https://github.com/vej-ai/dtex/releases/tag/v0.4.0
+[0.3.1]: https://github.com/vej-ai/dtex/releases/tag/v0.3.1
+[0.3.0]: https://github.com/vej-ai/dtex/releases/tag/v0.3.0
+[0.2.4]: https://github.com/vej-ai/dtex/releases/tag/v0.2.4
+[0.2.3]: https://github.com/vej-ai/dtex/releases/tag/v0.2.3
+[0.2.2]: https://github.com/vej-ai/dtex/releases/tag/v0.2.2
+[0.2.1]: https://github.com/vej-ai/dtex/releases/tag/v0.2.1
+[0.2.0]: https://github.com/vej-ai/dtex/releases/tag/v0.2.0
+[0.1.5]: https://github.com/vej-ai/dtex/releases/tag/v0.1.5
+[0.1.4]: https://github.com/vej-ai/dtex/releases/tag/v0.1.4
+[0.1.3]: https://github.com/vej-ai/dtex/releases/tag/v0.1.3
+[0.1.2]: https://github.com/vej-ai/dtex/releases/tag/v0.1.2
+[0.1.1]: https://github.com/vej-ai/dtex/releases/tag/v0.1.1
+[0.1.0]: https://github.com/vej-ai/dtex/releases/tag/v0.1.0

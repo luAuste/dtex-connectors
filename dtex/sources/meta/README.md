@@ -124,6 +124,11 @@ Same config, no mode switch; the persisted cursor decides:
   deleted/rejected ads), and merge on the natural grain makes the re-pull
   idempotent. Today is included and partial on purpose; the next run
   overwrites it.
+- **"Today" is each ad account's own day**, read from its `timezone_name`
+  once per run, not UTC's: an account ahead of UTC gets its new day
+  requested as soon as it starts, not at UTC midnight, and an account
+  behind UTC is never asked for a day that has not begun. No timezone
+  returned -> UTC.
 
 ```bash
 export META_ACCESS_TOKEN="EAA..."

@@ -173,10 +173,11 @@ class MetaClient:
     def get_account(self, account_id: str, fields: str) -> dict[str, Any]:
         """``GET /<ver>/act_<id>?fields=...`` — one ad-account object.
 
-        Used once per run per account by the hourly stream to learn the
-        advertiser timezone (``timezone_name``, ``timezone_offset_hours_utc``)
-        that the ``hourly_stats_aggregated_by_advertiser_time_zone``
-        breakdown is expressed in.
+        Used once per run per account by both streams to learn the
+        advertiser timezone (``timezone_name``, ``timezone_offset_hours_utc``):
+        it decides the account's "today", and the
+        ``hourly_stats_aggregated_by_advertiser_time_zone`` breakdown is
+        expressed in it.
         """
         return self._get_json(f"/{self.api_version}/act_{account_id}", {"fields": fields})
 

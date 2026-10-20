@@ -6,6 +6,7 @@ Both streams share one extraction loop (``_walk``):
   a cursor exists, else ``start_date`` (virgin run = the backfill).
 * Walk ``[floor, today]`` in inclusive windows of ``window_days``,
   oldest -> newest; inside each window loop every configured ad account,
+  each clipped to ITS OWN today (see "Today" below),
   run one ASYNC Insights report job (``time_increment=1``, the stream's
   ``level`` / ``breakdowns``) and page its result — see client.py for why
   sync GETs are not used.
@@ -28,6 +29,16 @@ Streams:
   ``params:`` in the config (window_days / start_date) size its backfill
   independently.
 
+Today is the AD ACCOUNT's calendar day, not UTC's. Insights days
+(``date_start``, the hourly breakdown) are the account's own days, so every
+stream reads each account's ``timezone_name`` once per run and requests up
+to that account's today. Deciding "today" in UTC would leave the new day of
+an account ahead of UTC unrequested until UTC midnight, and would request a
+day that has not started yet for an account behind UTC. An account whose
+timezone Meta does not return falls back to UTC. The walk ends at the
+latest account's today (the cursor's value); an account still on an earlier
+day is caught up by the next run's lookback re-pull.
+
 Today is included on purpose: it is partial, and the next run's lookback
 re-pull (28 days by default — Meta's longest attribution restatement
 window) overwrites it via merge on the natural grain. The same re-pull
@@ -49,9 +60,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from itertools import chain
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dtex import Batch, Config, Cursor, stream
 
@@ -136,6 +148,42 @@ def _accessible_accounts(
     return kept, info
 
 
+def account_today(info: dict[str, Any], now: datetime) -> date | None:
+    """The ad account's current calendar day, from its ``GET act_<id>`` info.
+
+    ``timezone_name`` (IANA) first, then ``timezone_offset_hours_utc``;
+    ``None`` when Meta returned neither usably (the caller falls back to UTC).
+    """
+    tz_name = info.get("timezone_name")
+    if tz_name:
+        try:
+            return now.astimezone(ZoneInfo(str(tz_name))).date()
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    try:
+        offset = float(info["timezone_offset_hours_utc"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (now.astimezone(UTC) + timedelta(hours=offset)).date()
+
+
+def _today_by_account(
+    info_by_account: dict[str, dict[str, Any]], now: datetime, name: str, log: logging.Logger
+) -> dict[str, date]:
+    today_by_account: dict[str, date] = {}
+    for account, info in info_by_account.items():
+        today = account_today(info, now)
+        if today is None:
+            log.warning(
+                "meta.%s: act_%s returned no usable timezone — deciding its today in UTC",
+                name,
+                account,
+            )
+            continue
+        today_by_account[account] = today
+    return today_by_account
+
+
 def hourly_fields(value: Any) -> str:
     """Normalise the `hourly_fields` param; fail fast if a key field is missing."""
     names = [f.strip() for f in str(value or HOURLY_FIELDS).split(",") if f.strip()]
@@ -161,11 +209,17 @@ def _walk(
     breakdowns: str,
     project: Projector,
     key_desc: str,
+    today_by_account: dict[str, date] | None = None,
 ) -> Iterator[Batch]:
-    """Shared (window × account) async-report walk; see module docstring."""
+    """Shared (window × account) async-report walk; see module docstring.
+
+    ``today_by_account`` = each account's own today (missing -> UTC today).
+    """
     attribution = str(config.action_attribution_windows or "")
     run_ts = datetime.now(tz=UTC)
-    today = run_ts.date()
+    utc_today = run_ts.date()
+    today_by_account = today_by_account or {}
+    today = max((today_by_account.get(a, utc_today) for a in accounts), default=utc_today)
     start_floor = as_date(config.start_date)
 
     start_value = cursor.start_value()
@@ -194,10 +248,15 @@ def _walk(
     for win_start, win_end in iter_windows(first_day, today, int(config.window_days)):
         window_rows = 0
         for account in accounts:
+            # Never past the account's own today; a window wholly after it
+            # (account behind the latest one) is skipped.
+            account_end = min(win_end, today_by_account.get(account, utc_today))
+            if account_end < win_start:
+                continue
             # Bisect on async-job failure: the job fails BEFORE any page is
             # fetched, so nothing has been yielded and the sub-window can be
             # re-requested narrower; a 1-day window that still fails raises.
-            pending = [(win_start, win_end)]
+            pending = [(win_start, account_end)]
             while pending:
                 sub_start, sub_end = pending.pop(0)
                 account_rows = 0
@@ -295,10 +354,15 @@ def ads_insights(config: Config, cursor: Cursor, log: logging.Logger) -> Iterato
 
     client = _build_client(config)
     accounts = parse_accounts(config.account_ids)
-    if bool(config.get("skip_inaccessible_accounts", False)):
-        accounts, _ = _accessible_accounts(
-            client, accounts, "id", skip_inaccessible=True, name="ads_insights", log=log
-        )
+    # Timezone per account, fetched once per run — it decides each account's today.
+    accounts, info_by_account = _accessible_accounts(
+        client,
+        accounts,
+        ACCOUNT_TZ_FIELDS,
+        skip_inaccessible=bool(config.get("skip_inaccessible_accounts", False)),
+        name="ads_insights",
+        log=log,
+    )
 
     yield from _walk(
         name="ads_insights",
@@ -312,6 +376,7 @@ def ads_insights(config: Config, cursor: Cursor, log: logging.Logger) -> Iterato
         breakdowns="",
         project=project,
         key_desc="date_start/account_id/ad_id",
+        today_by_account=_today_by_account(info_by_account, run_ts, "ads_insights", log),
     )
 
 
@@ -328,7 +393,7 @@ def insights_hourly(config: Config, cursor: Cursor, log: logging.Logger) -> Iter
 
     # Timezone per account, fetched once per run — the hourly breakdown is
     # expressed in it, so it must ride with every row for downstream SQL to
-    # convert.
+    # convert; it also decides each account's today.
     accounts, info_by_account = _accessible_accounts(
         client,
         accounts,
@@ -373,4 +438,5 @@ def insights_hourly(config: Config, cursor: Cursor, log: logging.Logger) -> Iter
         breakdowns=HOURLY_BREAKDOWN,
         project=project,
         key_desc=f"date_start/{HOURLY_BREAKDOWN}/account_id/campaign_id",
+        today_by_account=_today_by_account(info_by_account, run_ts, "insights_hourly", log),
     )

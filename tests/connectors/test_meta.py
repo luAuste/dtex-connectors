@@ -36,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pytest
@@ -59,7 +60,7 @@ from dtex.sources.meta.records import (
     to_hourly_record,
     to_record,
 )
-from dtex.sources.meta.source import HOURLY_FIELDS, _walk, hourly_fields
+from dtex.sources.meta.source import HOURLY_FIELDS, _walk, account_today, hourly_fields
 
 # --------------------------------------------------------------------------
 # Stub Graph API server
@@ -566,7 +567,11 @@ class _FakeClient:
 
 
 def _run_walk(
-    client: Any, cursor: _FakeCursor, accounts: list[str], **config: Any
+    client: Any,
+    cursor: _FakeCursor,
+    accounts: list[str],
+    today_by_account: dict[str, date] | None = None,
+    **config: Any,
 ) -> list[list[dict[str, Any]]]:
     now = datetime.now(tz=UTC)
     return list(
@@ -582,6 +587,7 @@ def _run_walk(
             breakdowns="",
             project=lambda row, _a: to_record(row, now),
             key_desc="k",
+            today_by_account=today_by_account,
         )
     )
 
@@ -661,6 +667,44 @@ def test_walk_bisects_a_window_whose_job_keeps_failing() -> None:
     # A 1-day window that still fails is a real error.
     with pytest.raises(RuntimeError, match="1-day window"):
         _run_walk(_FakeClient(fail_over=0), _FakeCursor(None), ["1"], start_date=first.isoformat())
+
+
+def test_account_today_uses_the_account_timezone() -> None:
+    # 22:30 UTC is already the next day east of UTC, still the same day west.
+    now = datetime(2026, 3, 10, 22, 30, tzinfo=UTC)
+    assert account_today({"timezone_name": "Asia/Tokyo"}, now) == date(2026, 3, 11)
+    assert account_today({"timezone_name": "America/Los_Angeles"}, now) == date(2026, 3, 10)
+    # No / unknown IANA name -> the UTC offset; neither -> None (caller uses UTC).
+    assert account_today({"timezone_offset_hours_utc": 9}, now) == date(2026, 3, 11)
+    assert account_today(
+        {"timezone_name": "Not/AZone", "timezone_offset_hours_utc": -8}, now
+    ) == date(2026, 3, 10)
+    assert account_today({}, now) is None
+    assert account_today({"timezone_offset_hours_utc": "x"}, now) is None
+
+
+def test_walk_requests_each_account_up_to_its_own_today() -> None:
+    utc_today = datetime.now(tz=UTC).date()
+    ahead, behind = utc_today + timedelta(days=1), utc_today - timedelta(days=1)
+    client = _FakeClient()
+    cursor = _FakeCursor(None)
+    _run_walk(
+        client,
+        cursor,
+        ["east", "west", "unknown"],
+        today_by_account={"east": ahead, "west": behind},
+        start_date=behind.isoformat(),
+        window_days=2,
+    )
+    # Window 1 = [behind, utc_today]: each account clipped to its own today.
+    # Window 2 = [ahead, ahead]: only the account whose day has started.
+    assert client.calls == [
+        ("east", behind, utc_today),
+        ("west", behind, behind),
+        ("unknown", behind, utc_today),
+        ("east", ahead, ahead),
+    ]
+    assert cursor.observed == [utc_today, ahead]
 
 
 # --------------------------------------------------------------------------
@@ -774,7 +818,7 @@ def test_end_to_end_insights_hourly(
         "timezone_name": "America/Los_Angeles",
         "timezone_offset_hours_utc": -7,
     }
-    today = datetime.now(tz=UTC).date()
+    today = datetime.now(tz=ZoneInfo("America/Los_Angeles")).date()  # the account's day
     day = today.isoformat()
     graph.pages = [
         [
@@ -821,6 +865,58 @@ def test_end_to_end_insights_hourly(
     assert submit.params["breakdowns"] == HOURLY_BREAKDOWN
     assert json.loads(submit.params["time_range"]) == {"since": day, "until": day}
     assert re.fullmatch(r"/v21\.0/act_111/insights", submit.path)
+
+
+@pytest.mark.parametrize("stream", ["insights_hourly", "ads_insights"])
+def test_new_account_day_is_requested_before_utc_midnight(
+    graph_stub: tuple[_Graph, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: str,
+) -> None:
+    """An account ahead of UTC (UTC+14, so its day is UTC's or the next):
+    the walk runs to the ACCOUNT's today — under a UTC "today" its new day
+    went unrequested until UTC midnight. Re-running merges, never duplicates.
+    (The fixed-instant cases are in the account_today / _walk unit tests.)"""
+    graph, base_url = graph_stub
+    monkeypatch.setenv("META_ACCESS_TOKEN", "EAAe2e")
+    info = {"id": "act_111", "timezone_name": "Pacific/Kiritimati", "timezone_offset_hours_utc": 14}
+    graph.accounts["111"] = info
+    today = account_today(info, datetime.now(tz=UTC))
+    assert today is not None
+    yesterday = today - timedelta(days=1)
+    if stream == "insights_hourly":
+        graph.pages = [
+            [
+                _hourly_row(yesterday.isoformat(), "23:00:00 - 23:59:59"),
+                _hourly_row(today.isoformat(), "0:00:00 - 0:59:59"),
+            ]
+        ]
+        streams = "  insights_hourly:\n    params:\n      window_days: 30\n"
+    else:
+        graph.pages = [[_ad_row(yesterday.isoformat()), _ad_row(today.isoformat())]]
+        streams = "  ads_insights:"
+    _write_project(tmp_path)
+    _write_config(tmp_path, base_url=base_url, streams=streams, start_date=yesterday.isoformat())
+    db_path = str(tmp_path / "warehouse.duckdb")
+    for _ in range(2):
+        result = dtex.run(
+            config="meta_test",
+            project_dir=str(tmp_path),
+            destination_params_override={"path": db_path},
+        )
+        assert result.status.value == "succeeded", result.error
+
+    submits = [r for r in graph.captured if r.method == "POST"]
+    assert [json.loads(r.params["time_range"])["until"] for r in submits] == [today.isoformat()] * 2
+    conn = duckdb.connect(db_path)
+    days = conn.execute(
+        f"SELECT date_start, COUNT(*) FROM {stream} GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    cursor_after = _cursor(conn, stream)
+    conn.close()
+    assert days == [(yesterday, 1), (today, 1)]  # once each, after 2 runs
+    assert cursor_after == today
 
 
 def test_hourly_fields_default_matches_register() -> None:

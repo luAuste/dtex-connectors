@@ -10,6 +10,16 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+### Fixed
+
+- **meta: "today" is the ad account's day, not UTC's.** Both streams now
+  read each account's `timezone_name` once per run and walk up to that
+  account's own today. With a UTC today, an account ahead of UTC had its
+  new day unrequested until UTC midnight (hours after it began), and an
+  account behind UTC was asked for a day that had not started.
+  `ads_insights` now makes the same one `GET act_<id>` per account per run
+  that `insights_hourly` already made.
+
 ## [0.18.0] — 2026-09-24
 
 ### Added

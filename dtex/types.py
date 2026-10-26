@@ -1,0 +1,2677 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Albinas Plesnys
+
+"""dtex contract types — the core type definitions every module imports.
+
+This module (``dtex/types.py``) is the authoritative, in-code expression
+of the dtex connector contract. It contains *only* type definitions and their small intrinsic
+behavior (enum parsing, schema lookup, cursor bookkeeping, validation). It
+holds **no** engine logic: no YAML reading, no connector discovery, no run
+loop. Those belong to later build stages.
+
+Doc references in docstrings point at the design handbook under ``docs/``:
+``docs/02-architecture.md``, ``docs/03-connector-contract.md``,
+``docs/04-connector-body.md``, ``docs/05-destinations-and-state.md``,
+``docs/07-cli-and-library-api.md``, ``docs/09-logging-and-observability.md``.
+
+Design choices made where the handbook left a micro-detail ambiguous are
+tagged with ``# NOTE:`` comments.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from enum import Enum, StrEnum
+from typing import Any, ClassVar, Protocol, runtime_checkable
+
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
+
+Record = dict[str, Any]
+"""One record: a flat dict — column names to JSON-serializable values.
+
+Mirrors docs/04 "A record is a flat ``dict``". Nested data lives under a key
+whose declared column ``type`` is :attr:`FieldType.JSON`.
+"""
+
+Batch = list[Record]
+"""A batch: a ``list[dict]`` — the unit of transfer source → destination.
+
+Mirrors docs/04 "A batch is a ``list[dict]``". A ``@stream`` generator yields
+batches; ``@destination.write_batch`` receives one batch per call. There is
+deliberately no heavier envelope object — per-batch metadata (table, schema,
+write disposition) arrives as the hook's own arguments.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Enum base — string-valued enums that parse leniently from YAML scalars
+# ---------------------------------------------------------------------------
+
+
+class _StrEnum(StrEnum):
+    """Base for string-valued enums parsed from ``register.yaml`` scalars.
+
+    ``parse()`` accepts the enum value, the member name, and is
+    case-insensitive — so a YAML author may write ``merge`` / ``MERGE`` /
+    ``Merge`` interchangeably. This is the single coercion point for every
+    contract enum loaded from YAML.
+
+    # NOTE: subclasses ``enum.StrEnum`` (Python 3.11+, the project's floor) so
+    # a member *is* a ``str`` — ``WriteDisposition.MERGE == "merge"`` and YAML
+    # serialization is trivial. ``StrEnum`` preserves *explicit* string values
+    # verbatim (it only lowercases ``auto()``), so ``FieldType.STRING`` keeps
+    # its uppercase ``"STRING"`` value as the handbook requires.
+    """
+
+    @classmethod
+    def parse(cls, value: Any) -> Any:
+        """Coerce a YAML scalar (or an existing member) into a member.
+
+        Raises :class:`ValueError` listing the valid options on a bad value,
+        which is the message ``dtex validate`` surfaces to the author.
+        """
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{cls.__name__} expects a string, got {type(value).__name__}: {value!r}"
+            )
+        key = value.strip()
+        for member in cls:
+            if key == member.value or key.lower() == member.value.lower():
+                return member
+            if key.upper() == member.name:
+                return member
+        valid = ", ".join(repr(m.value) for m in cls)
+        raise ValueError(f"{key!r} is not a valid {cls.__name__}; expected one of: {valid}")
+
+
+# ---------------------------------------------------------------------------
+# Enums / constants
+# ---------------------------------------------------------------------------
+
+
+class Capability(Enum):
+    """A capability a destination connector declares — docs/05 §1, docs/09 §4.
+
+    The set returned by ``@destination.capabilities`` fixes the destination's
+    capability tier at init time and drives engine behavior (whether ``merge``
+    is allowed, whether the destination hosts its own state table, etc.).
+
+    # NOTE: docs/05 §1 originally enumerated four members. Stage 8a added
+    # ``RUN_RECORDS`` (docs/09 §4) to gate the ``_dtex_runs`` audit table
+    # without a contract break — destinations without it remain valid and
+    # still produce the per-run JSONL log. The enum is now the source of
+    # truth; docs/05 §1 follows it.
+    """
+
+    STATE = "state"
+    """Destination can host the ``_dtex_state`` table itself (Tier A)."""
+    MERGE = "merge"
+    """Destination supports the ``merge`` (upsert) write disposition."""
+    SCHEMA_EVOLUTION = "schema_evolution"
+    """Destination can ``ALTER TABLE ADD COLUMN`` for additive evolution."""
+    TRANSACTIONAL_LOAD = "transactional_load"
+    """Destination can make a batch load + state commit atomic-ish."""
+    RUN_RECORDS = "run_records"
+    """Destination can host the ``_dtex_runs`` audit table itself (docs/09 §4).
+
+    A destination that declares this capability MUST implement
+    ``@destination.write_run_record`` — the engine calls it once per run, after
+    streams finish and before ``close``, with a fully-built :class:`RunRecord`.
+    Without this capability the engine still writes the per-run JSONL log file
+    but skips the destination-side audit row.
+    """
+    LEASE = "lease"
+    """Destination can host the ``_dtex_leases`` table for stream run-leasing.
+
+    A destination that declares this capability MUST implement the three
+    lease hooks — ``@destination.read_leases`` / ``acquire_lease`` /
+    ``release_lease``. With it, the engine leases each stream before running
+    it: a stream already held by a *live* (fresh-heartbeat) lease from another
+    build is skipped as :attr:`StreamStatus.SKIPPED_LEASED` instead of
+    double-run. Without it, the engine skips the whole lease path and behaves
+    exactly as before (sequential, no cross-build coordination) — leasing is
+    strictly additive and backward-compatible. See docs/05 §5.5.
+    """
+
+
+class WriteDisposition(_StrEnum):
+    """How a stream's records land in the destination — docs/03 §2.2, docs/05 §4.
+
+    ``merge`` additionally requires a ``primary_key`` and a destination with
+    :attr:`Capability.MERGE`; both are validated by the engine at planning time.
+    """
+
+    APPEND = "append"
+    """Insert all rows. Duplicates are the source's concern."""
+    MERGE = "merge"
+    """Upsert on ``primary_key``: insert new rows, overwrite matched rows."""
+    REPLACE = "replace"
+    """Truncate the table, then load — full-snapshot semantics."""
+
+
+class FieldType(_StrEnum):
+    """Logical column type — docs/03 §2.2.1.
+
+    A small portable type system; the destination maps each member to a native
+    warehouse type (docs/05 §3.1). Stored uppercase to match the handbook's
+    schema-entry examples (``type: STRING``).
+
+    # NOTE: ``BYTES`` is included beyond docs/03 §2.2.1's original 7-member
+    # list — every target warehouse (DuckDB BLOB, BigQuery BYTES, Snowflake
+    # BINARY, Postgres BYTEA) has a binary type, and binary-handling sources
+    # (raw signatures, file bytes) need it. This module is the source of
+    # truth; docs/03 §2.2.1 and docs/05 §3.1 follow it.
+    """
+
+    STRING = "STRING"
+    INTEGER = "INTEGER"
+    FLOAT = "FLOAT"
+    BOOLEAN = "BOOLEAN"
+    TIMESTAMP = "TIMESTAMP"
+    DATE = "DATE"
+    JSON = "JSON"
+    BYTES = "BYTES"
+
+
+class CoercionError(ValueError):
+    """One record-cell value could not be coerced to its declared :class:`FieldType`.
+
+    Raised by the engine's NORMALIZE step (``dtex.engine.normalize``) when a
+    value the source yielded does not fit the target column's logical type and
+    the per-FieldType coercion table has no rule that accepts the input shape.
+    The message is built operator-first: column name, the offending value (
+    ``repr``-quoted so whitespace and quotes are visible, truncated to 80
+    chars), the source Python type, and the target :class:`FieldType` —
+    everything an operator needs to act without reading a traceback.
+
+    Subclasses :class:`ValueError` so existing ``except (ValueError, ...)``
+    handlers in connector / destination code still catch it; the engine's
+    ``_run_one_stream`` catches it inside the per-stream transaction, which
+    rolls back any batches written so far in the stream and bubbles the
+    error up through the same ``stream_failed`` event as any other batch-
+    write failure (docs/09 §2).
+
+    # NOTE: subclasses :class:`ValueError` (not a brand-new top-level
+    # exception class) deliberately — a coercion failure is, semantically,
+    # a value-domain error. Today's BigQuery destination raises
+    # ``ArrowInvalid`` from the same root cause; folding the new error into
+    # the same Python supertype keeps the engine's mid-stream-failure
+    # rollback path uniform (it already catches ``Exception``), and lets
+    # callers that want the structured fields (``column``, ``value``,
+    # ``source_type``, ``target_type``) isinstance-check for
+    # ``CoercionError`` while preserving compatibility for callers that
+    # only care it's a value error.
+    """
+
+    _VALUE_REPR_MAX = 80
+
+    def __init__(
+        self,
+        *,
+        column: str,
+        value: Any,
+        source_type: type,
+        target_type: FieldType,
+    ) -> None:
+        self.column = column
+        self.value = value
+        self.source_type = source_type
+        self.target_type = target_type
+        truncated = self._truncate(repr(value))
+        message = (
+            f"column {column!r}: could not coerce {truncated} "
+            f"({source_type.__name__}) to {target_type.value}"
+        )
+        super().__init__(message)
+
+    @classmethod
+    def _truncate(cls, text: str) -> str:
+        """Truncate a ``repr`` rendering to :attr:`_VALUE_REPR_MAX` chars + ellipsis.
+
+        The cap keeps a single rogue 12 MB JSON cell from blowing up an
+        operator's log line. The trailing ``…`` makes the truncation visible.
+        """
+        if len(text) <= cls._VALUE_REPR_MAX:
+            return text
+        return text[: cls._VALUE_REPR_MAX - 1] + "…"
+
+
+class FieldMode(_StrEnum):
+    """Column nullability / repetition — docs/03 §2.2.1.
+
+    ``REPEATED`` targets destinations with a native array type; on destinations
+    that lack one it degrades to a ``JSON`` column.
+    """
+
+    NULLABLE = "NULLABLE"
+    REQUIRED = "REQUIRED"
+    REPEATED = "REPEATED"
+
+
+class CursorType(_StrEnum):
+    """How an incremental cursor value is compared and stored — docs/03 §2.2.
+
+    Stored lowercase to match the handbook's ``incremental.cursor_type``
+    examples and the ``_dtex_state.cursor_type`` column.
+    """
+
+    TIMESTAMP = "timestamp"
+    DATE = "date"
+    INT = "int"
+    STRING = "string"
+
+
+class ConnectorKind(_StrEnum):
+    """Whether a connector reads from or writes to the outside world — docs/03 §2.1."""
+
+    SOURCE = "source"
+    """Exposes ``@stream`` functions that *yield* records."""
+    DESTINATION = "destination"
+    """Exposes ``@destination`` hooks that *accept* records."""
+
+
+class PartitionType(_StrEnum):
+    """How the destination should physically partition the table — docs/05 §3.x.
+
+    A stream's :attr:`StreamDef.partition_by` resolves to a
+    :class:`PartitionConfig` whose ``type`` is one of these members. Only the
+    BigQuery destination honors partitioning today; destinations without a
+    native partitioning concept (DuckDB) treat the field as informational.
+
+    * ``TIME`` — time-based partitioning on the ``field`` column; the column
+      must be a ``TIMESTAMP`` or ``DATE``. ``granularity`` picks the bucket.
+    * ``RANGE`` — integer-range partitioning on the ``field`` column;
+      requires the ``range`` block (start / end / interval).
+    * ``INGESTION`` — partition by load timestamp (BigQuery's pseudo-column
+      ``_PARTITIONTIME``). ``field`` must be ``None`` — there is no source
+      column to bind. Useful for append-only logs without a natural date
+      column.
+    * ``NONE`` — explicitly unpartitioned. The declaration exists to
+      *suppress* the engine's cursor-based auto-default: without it, a
+      timestamp-cursor stream is silently promoted to TIME/DAY on the
+      cursor column, which is hazardous for backfill-heavy streams — a
+      bootstrap sweep writes rows from the whole table history into every
+      batch, and each load then touches hundreds of partitions, exhausting
+      BigQuery's partition-modification quota. ``field`` / ``granularity``
+      / ``range`` must all be absent. YAML short form: ``partition_by: none``.
+    """
+
+    TIME = "time"
+    RANGE = "range"
+    INGESTION = "ingestion"
+    NONE = "none"
+
+
+class TimeGranularity(_StrEnum):
+    """Time-partition bucket size — docs/05 §3.x.
+
+    Members align 1:1 with BigQuery's ``TimePartitioningType`` so the
+    destination's mapping is trivial. ``DAY`` is the default (and BigQuery's
+    own historical default) when a short-form ``partition_by`` is used.
+    """
+
+    HOUR = "hour"
+    DAY = "day"
+    MONTH = "month"
+    YEAR = "year"
+
+
+class SchemaContract(_StrEnum):
+    """Per-stream schema-evolution policy — docs/05 §3.2.
+
+    Locked design decision: the default is ``evolve`` (auto-additive); a stream
+    may opt into ``strict`` in ``register.yaml`` via ``schema_contract: strict``.
+    """
+
+    EVOLVE = "evolve"
+    """New source fields are added automatically with ``ALTER TABLE ADD COLUMN``."""
+    STRICT = "strict"
+    """Any schema difference from the existing table fails the run."""
+
+
+class SchemaDrift(_StrEnum):
+    """Run-level policy for VALUE-level schema drift — docs/02 §Normalize.
+
+    Distinct from :class:`SchemaContract`, which governs *table*-level column
+    evolution (add-column vs. fail). ``SchemaDrift`` governs what NORMALIZE does
+    when a cell's actual value contradicts its declared :class:`FieldType` — the
+    case that took prod down on 2026-07-24 (a declared ``BYTES`` column started
+    yielding ``bool``, and the strict coercion raised, killing every run).
+
+    Locked design decision: the default is ``warn`` (lenient). A stale declared
+    schema is the norm for a live upstream source, and one drifted cell must not
+    kill a 23-stream run; the strict ``fail`` mode is the opt-in escape hatch for
+    pipelines that would rather stop than carry a coerced/nulled value.
+    """
+
+    WARN = "warn"
+    """Coerce what is coercible; on a coercion failure, fall back to a safe
+    representation (``str(value)`` for STRING-able targets, else ``NULL``) and
+    log ONE ``schema_drift`` warning per (stream, column). The run continues."""
+    FAIL = "fail"
+    """Any un-coercible value raises :class:`CoercionError` — the pre-0.6.5
+    behavior. For pipelines that must stop on drift rather than carry it."""
+
+
+class ParamType(_StrEnum):
+    """The value type of a declared connector param — docs/03 §2.4.
+
+    # NOTE: distinct from :class:`FieldType`. ``ParamType`` types *config knobs*
+    # (``page_size``, ``start_date``) and has exactly four lowercase members per
+    # docs/03 §2.4; ``FieldType`` types *table columns* and is uppercase per
+    # docs/03 §2.2.1. They are deliberately not the same enum.
+    """
+
+    STRING = "string"
+    INT = "int"
+    FLOAT = "float"
+    BOOL = "bool"
+
+
+class RunStatus(_StrEnum):
+    """Terminal status of a run — docs/07 §4.1, docs/09 §4."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class RunInterrupted(BaseException):
+    """The run was terminated by ``SIGTERM`` — docs/07 §3.
+
+    Raised in the main thread by the handler :func:`dtex.run` installs for the
+    duration of a run, so a platform kill (Cloud Build timeout, Kubernetes pod
+    eviction, ``kill <pid>``) unwinds the engine the same way Ctrl-C does:
+    the destination transaction rolls back, every lease this run holds is
+    released, the run record is written FAILED, and the destination closes.
+    Derives from :class:`BaseException` (like :class:`KeyboardInterrupt`) so
+    ``except Exception`` handlers in connectors and the engine never swallow
+    it. ``dtex.run`` re-raises it; the CLI exits 143.
+    """
+
+
+class StreamStatus(_StrEnum):
+    """Terminal status of one stream within a run — docs/07 §4.1, docs/09 §2."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    SKIPPED_LEASED = "skipped_leased"
+    """Skipped because another live run holds this stream's lease — docs/05 §5.5.
+
+    Distinct from :attr:`SKIPPED` (which means "not selected this run"):
+    ``SKIPPED_LEASED`` means the stream *was* selected but a concurrent build
+    is already running it (a fresh-heartbeat lease exists in ``_dtex_leases``),
+    so this build stepped over it and ran the rest. A run with only
+    ``SUCCEEDED`` / ``SKIPPED`` / ``SKIPPED_LEASED`` streams still succeeds —
+    a leased skip is cooperative, not a failure."""
+
+
+# ---------------------------------------------------------------------------
+# Partitioning — the resolved per-stream physical-partitioning spec (docs/05 §3.x)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PartitionRange:
+    """An integer-range partition window — docs/05 §3.x.
+
+    Mirrors BigQuery's ``PartitionRange(start, end, interval)``. ``start`` is
+    inclusive, ``end`` exclusive; ``interval`` is the per-bucket span. All
+    three are plain integers — the column is :class:`FieldType.INTEGER` on the
+    destination side.
+
+    Used only when :attr:`PartitionConfig.type` is :attr:`PartitionType.RANGE`.
+    """
+
+    start: int
+    end: int
+    interval: int
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PartitionRange:
+        """Build a :class:`PartitionRange` from a parsed YAML mapping.
+
+        Required keys: ``start``, ``end``, ``interval``. Unknown keys are a
+        hard error, mirroring the rest of the contract's discovery rules.
+        """
+        known = {"start", "end", "interval"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(
+                f"unknown partition.range key(s): {', '.join(sorted(unknown))}"
+            )
+        for required in ("start", "end", "interval"):
+            if required not in data:
+                raise ValueError(f"partition.range requires a {required!r} key")
+        return cls(
+            start=int(data["start"]),
+            end=int(data["end"]),
+            interval=int(data["interval"]),
+        )
+
+
+@dataclass(frozen=True)
+class PartitionConfig:
+    """Resolved partition specification — docs/05 §3.x.
+
+    Built by the engine from one of three sources, in precedence order:
+
+    1. The active :class:`PipelineConfig`'s ``partition_overrides[stream_name]``
+       (wins on conflict).
+    2. The source stream's :attr:`StreamDef.partition_by` (set in
+       ``register.yaml``).
+    3. The cursor-based auto-default (incremental streams whose cursor is
+       ``timestamp`` or ``date``).
+
+    Passed to the destination via :attr:`StreamMeta.partition`. Only the
+    BigQuery destination honors it today (DuckDB ignores the field — it has
+    no native partitioning; the field is purely informational there).
+
+    # NOTE: today only BigQuery honors this. DuckDB ignores it gracefully.
+    # When a future destination (Snowflake clustering keys, ClickHouse
+    # partition keys, Postgres declarative partitioning) wires this in, it
+    # reads from the same single ``StreamMeta.partition`` field — no contract
+    # change required.
+    """
+
+    field: str | None
+    """The column to partition on. ``None`` is valid *only* for
+    :attr:`PartitionType.INGESTION` (BigQuery binds to the
+    ``_PARTITIONTIME`` pseudo-column instead)."""
+
+    type: PartitionType
+    """How the destination partitions: time / range / ingestion."""
+
+    granularity: TimeGranularity | None = None
+    """Bucket size for :attr:`PartitionType.TIME` (required there, forbidden
+    elsewhere). ``DAY`` is the conventional default."""
+
+    range: PartitionRange | None = None
+    """Range window for :attr:`PartitionType.RANGE` (required there,
+    forbidden elsewhere)."""
+
+    def __post_init__(self) -> None:
+        """Validate the type/field/granularity/range combination — docs/05 §3.x.
+
+        Catches malformed PartitionConfig values at construction time so a bad
+        YAML never reaches the destination hook. The rules:
+
+        * ``type=TIME`` — needs ``granularity``; ``range`` must be absent;
+          ``field`` is required (it names the column to partition on).
+        * ``type=RANGE`` — needs ``range``; ``granularity`` must be absent;
+          ``field`` is required.
+        * ``type=INGESTION`` — ``field`` must be ``None`` (BigQuery binds to
+          the ``_PARTITIONTIME`` pseudo-column); ``granularity`` and ``range``
+          must both be absent. The bucket is implicitly DAY on BigQuery's
+          ingestion-time partitioning.
+        """
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate combinations — see :meth:`__post_init__` for the rules.
+
+        Raises :class:`ValueError` with a message naming the offending key,
+        so a malformed ``register.yaml`` or ``partition_overrides:`` entry
+        fails the run with a clear, actionable diagnostic.
+        """
+        if self.type is PartitionType.TIME:
+            if self.field is None:
+                raise ValueError(
+                    "partition_by type='time' requires a 'field' (column name)"
+                )
+            if self.granularity is None:
+                raise ValueError(
+                    "partition_by type='time' requires a 'granularity' "
+                    "(hour / day / month / year)"
+                )
+            if self.range is not None:
+                raise ValueError(
+                    "partition_by type='time' must not declare a 'range' block"
+                )
+        elif self.type is PartitionType.RANGE:
+            if self.field is None:
+                raise ValueError(
+                    "partition_by type='range' requires a 'field' (column name)"
+                )
+            if self.range is None:
+                raise ValueError(
+                    "partition_by type='range' requires a 'range' block with "
+                    "start / end / interval"
+                )
+            if self.granularity is not None:
+                raise ValueError(
+                    "partition_by type='range' must not declare a 'granularity' "
+                    "(granularity is for type='time' only)"
+                )
+        elif self.type is PartitionType.INGESTION:
+            if self.field is not None:
+                raise ValueError(
+                    "partition_by type='ingestion' must not declare a 'field' "
+                    "(BigQuery binds to the _PARTITIONTIME pseudo-column)"
+                )
+            if self.granularity is not None:
+                raise ValueError(
+                    "partition_by type='ingestion' must not declare a "
+                    "'granularity' (the bucket is implicitly DAY)"
+                )
+            if self.range is not None:
+                raise ValueError(
+                    "partition_by type='ingestion' must not declare a 'range' "
+                    "block"
+                )
+        else:  # PartitionType.NONE
+            if self.field is not None or self.granularity is not None or self.range is not None:
+                raise ValueError(
+                    "partition_by type='none' must not declare 'field', "
+                    "'granularity' or 'range' — it means explicitly unpartitioned"
+                )
+
+    @classmethod
+    def from_short(cls, field: str) -> PartitionConfig:
+        """Short form: a bare column name — defaults to TIME + DAY granularity.
+
+        The historical shape (``partition_by: created_date``). The engine
+        applies this default at resolution time; on a non-time column or a
+        non-time cursor (INT / STRING), the resolver *degrades* the short form
+        to "no partition + warning" rather than erroring — see the resolver's
+        NOTE for the backward-compat reasoning.
+        """
+        return cls(
+            field=field,
+            type=PartitionType.TIME,
+            granularity=TimeGranularity.DAY,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | str) -> PartitionConfig:
+        """Parse either the short string form or the long-form dict.
+
+        * Short form — ``data`` is a string column name → :meth:`from_short`.
+        * Long form — ``data`` is a mapping with ``field`` / ``type`` /
+          optional ``granularity`` / optional ``range``.
+
+        Unknown keys at the top level raise :class:`ValueError` so a typo in a
+        ``register.yaml`` or ``partition_overrides:`` entry never silently
+        drops a partition declaration.
+        """
+        if isinstance(data, str):
+            # NOTE: the literal string "none" is the opt-out, not a column
+            # name. YAML `partition_by: none` parses as the *string* "none"
+            # (YAML's null spellings are null/~/empty — `none` is not one),
+            # so this is the natural spelling for "explicitly unpartitioned".
+            if data.strip().lower() == "none":
+                return cls(field=None, type=PartitionType.NONE)
+            return cls.from_short(data)
+        if not isinstance(data, Mapping):
+            raise ValueError(
+                f"partition_by must be a string (column name) or a mapping; "
+                f"got {type(data).__name__}"
+            )
+        known = {"field", "type", "granularity", "range"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(
+                f"unknown partition_by key(s): {', '.join(sorted(unknown))}"
+            )
+        if "type" not in data:
+            raise ValueError(
+                "partition_by mapping requires a 'type' "
+                "(one of: time / range / ingestion)"
+            )
+        ptype = PartitionType.parse(data["type"])
+        field_value = data.get("field")
+        gran_raw = data.get("granularity")
+        granularity: TimeGranularity | None
+        if gran_raw is None:
+            # For TIME, default to DAY (the common case) so a user writing
+            # `type: time` without a granularity gets the convention.
+            granularity = TimeGranularity.DAY if ptype is PartitionType.TIME else None
+        else:
+            granularity = TimeGranularity.parse(gran_raw)
+        range_raw = data.get("range")
+        range_block: PartitionRange | None = None
+        if range_raw is not None:
+            if not isinstance(range_raw, Mapping):
+                raise ValueError(
+                    f"partition_by.range must be a mapping; "
+                    f"got {type(range_raw).__name__}"
+                )
+            range_block = PartitionRange.from_dict(range_raw)
+        return cls(
+            field=None if field_value is None else str(field_value),
+            type=ptype,
+            granularity=granularity,
+            range=range_block,
+        )
+
+    def describe(self) -> str:
+        """One-line human description for logs / error messages.
+
+        Shapes the partition spec into a compact form like
+        ``"created (TIME/DAY)"`` or ``"created (RANGE 0..10000000000/86400)"``
+        or ``"_PARTITIONTIME (INGESTION/DAY)"``. Used by the engine's
+        ``stream_start`` event and by the drift-mismatch error message.
+        """
+        if self.type is PartitionType.TIME:
+            assert self.granularity is not None  # validated
+            return f"{self.field} (TIME/{self.granularity.value.upper()})"
+        if self.type is PartitionType.RANGE:
+            assert self.range is not None  # validated
+            return (
+                f"{self.field} (RANGE {self.range.start}..{self.range.end}"
+                f"/{self.range.interval})"
+            )
+        if self.type is PartitionType.INGESTION:
+            # field is None
+            return "_PARTITIONTIME (INGESTION/DAY)"
+        # NONE — explicitly unpartitioned
+        return "none (explicitly unpartitioned)"
+
+
+def _parse_partition_by(value: Any) -> str | PartitionConfig | None:
+    """Parse a YAML ``partition_by`` value into the typed shape.
+
+    Accepted shapes (docs/05 §3.x):
+
+    * ``None`` — no declaration; the engine may compute an auto-default.
+    * the string ``"none"`` — the explicit opt-out; promoted here to a
+      :class:`PartitionConfig` of type ``NONE`` so the resolver suppresses
+      its cursor-based auto-default.
+    * any other string — the short form (column name). Stored verbatim; the
+      engine promotes it to a :class:`PartitionConfig` at resolution time
+      with the cursor type in hand (see the resolver's NOTE in
+      :mod:`dtex.engine.runner`).
+    * a mapping — the long form, parsed by :meth:`PartitionConfig.from_dict`.
+
+    Kept as a module-level helper so :class:`PipelineConfig`'s
+    ``partition_overrides`` parser can reuse the exact same coercion.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        # The opt-out spelling is promoted to a typed PartitionConfig here
+        # so the resolver's short-form-degradation path (which treats a bare
+        # string as a column name) never sees it.
+        if value.strip().lower() == "none":
+            return PartitionConfig(field=None, type=PartitionType.NONE)
+        return value
+    if isinstance(value, PartitionConfig):
+        return value
+    if isinstance(value, Mapping):
+        return PartitionConfig.from_dict(value)
+    raise ValueError(
+        f"partition_by must be null, a string, or a mapping; "
+        f"got {type(value).__name__}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Schema types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Field:
+    """One column definition — mirrors a ``register.yaml`` ``schema[]`` entry.
+
+    docs/03 §2.2.1. Frozen because a declared schema is immutable contract data;
+    schema *evolution* produces a new :class:`Schema`, it never mutates a field.
+    """
+
+    name: str
+    type: FieldType
+    mode: FieldMode = FieldMode.NULLABLE
+    description: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Field:
+        """Build a :class:`Field` from a parsed YAML mapping — docs/03 §2.2.1.
+
+        ``type`` is required; ``mode`` defaults to ``NULLABLE``; ``description``
+        defaults to ``""``. Unknown keys raise, mirroring the handbook's
+        "unknown keys are a hard error" discovery rule (docs/03 §7).
+        """
+        known = {"name", "type", "mode", "description"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"unknown schema field key(s): {', '.join(sorted(unknown))}")
+        if "name" not in data:
+            raise ValueError("schema field requires a 'name'")
+        if "type" not in data:
+            raise ValueError(f"schema field {data['name']!r} requires a 'type'")
+        return cls(
+            name=str(data["name"]),
+            type=FieldType.parse(data["type"]),
+            mode=FieldMode.parse(data.get("mode", FieldMode.NULLABLE)),
+            description=str(data.get("description", "")),
+        )
+
+
+@dataclass(frozen=True)
+class Schema:
+    """An ordered list of :class:`Field` — a stream's column definitions.
+
+    docs/03 §2.2.1 / docs/05 §3.1. ``Schema`` is the typed carrier of a
+    stream's declared columns; a destination's ``ensure_schema`` translates it
+    into native DDL. Frozen — evolution returns a new ``Schema``.
+    """
+
+    fields: tuple[Field, ...] = ()
+
+    SYNCED_AT_COLUMN: ClassVar[str] = "_dtex_synced_at"
+    """Name of the load-timestamp column the engine appends to every record.
+
+    # NOTE: ``ClassVar`` — a true class constant, deliberately excluded from
+    # the dataclass field set so it is not an ``__init__`` arg, not compared
+    # by ``__eq__``, and not rebindable per instance.
+    """
+
+    @classmethod
+    def from_list(cls, items: list[Mapping[str, Any]] | None) -> Schema | None:
+        """Build a :class:`Schema` from a parsed YAML ``schema`` list.
+
+        Returns ``None`` when ``items`` is ``None`` — the handbook's signal for
+        "no declared schema, infer from the first batch" (docs/03 §2.2.1).
+        """
+        if items is None:
+            return None
+        return cls(fields=tuple(Field.from_dict(item) for item in items))
+
+    def field(self, name: str) -> Field | None:
+        """Look up a field by column name; ``None`` if absent."""
+        for f in self.fields:
+            if f.name == name:
+                return f
+        return None
+
+    def has(self, name: str) -> bool:
+        """Whether a column of this name is declared."""
+        return self.field(name) is not None
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """The declared column names, in order."""
+        return tuple(f.name for f in self.fields)
+
+    @staticmethod
+    def synced_at_field() -> Field:
+        """The engine-appended ``_dtex_synced_at`` column — docs/03 §2.2.1.
+
+        # NOTE: this column is *not* baked into a declared ``Schema`` at parse
+        # time — that would conflate author-declared columns with the engine's
+        # contribution. The engine calls :meth:`with_synced_at` just before
+        # handing a schema to ``ensure_schema``, keeping the two concerns
+        # separate. The column is ``NULLABLE`` so an existing table can have it
+        # added by additive evolution.
+        """
+        return Field(
+            name=Schema.SYNCED_AT_COLUMN,
+            type=FieldType.TIMESTAMP,
+            mode=FieldMode.NULLABLE,
+            description="Engine-set load timestamp.",
+        )
+
+    def with_synced_at(self) -> Schema:
+        """Return a new :class:`Schema` with ``_dtex_synced_at`` appended.
+
+        Idempotent: if the column is already present the schema is returned
+        unchanged, so re-appending on a resumed run is safe.
+        """
+        if self.has(Schema.SYNCED_AT_COLUMN):
+            return self
+        return Schema(fields=(*self.fields, self.synced_at_field()))
+
+    def __iter__(self) -> Iterator[Field]:
+        """Iterate the declared fields in order."""
+        return iter(self.fields)
+
+    def __len__(self) -> int:
+        """Number of declared fields."""
+        return len(self.fields)
+
+
+# ---------------------------------------------------------------------------
+# Manifest types — the parsed register.yaml (docs/03 §2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ParamSpec:
+    """A declared, typed configuration knob — mirrors ``register.yaml`` ``params``.
+
+    docs/03 §2.4. ``required: true`` with no ``default`` and no supplied value
+    fails discovery-time validation.
+    """
+
+    type: ParamType
+    default: Any = None
+    required: bool = False
+    description: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ParamSpec:
+        """Build a :class:`ParamSpec` from a parsed YAML mapping — docs/03 §2.4."""
+        known = {"type", "default", "required", "description"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"unknown param key(s): {', '.join(sorted(unknown))}")
+        if "type" not in data:
+            raise ValueError("param spec requires a 'type'")
+        return cls(
+            type=ParamType.parse(data["type"]),
+            default=data.get("default"),
+            required=bool(data.get("required", False)),
+            description=str(data.get("description", "")),
+        )
+
+
+@dataclass(frozen=True)
+class SecretRef:
+    """A declared secret reference — mirrors a ``register.yaml`` ``secrets[]`` entry.
+
+    docs/03 §2.5. The value is *referenced*, never inlined: ``ref`` is a
+    resolution expression resolved lazily at run time.
+    """
+
+    name: str
+    ref: str
+    # ``optional: true`` — a ref that does not resolve (env var unset,
+    # profile key or managed secret missing) is left out of
+    # ``config.secrets`` instead of failing the run. For a credential that
+    # only unlocks an extra stream: the body checks ``"name" in
+    # config.secrets`` and skips that work when it is absent.
+    optional: bool = False
+
+    # NOTE: stage 9a added a third resolver form — ``secret://<scheme>/<path>[#<field>]``
+    # — for pluggable cloud secret managers (docs/08 §3, Q3 resolved). The
+    # original two-form contract still holds for the two BUILT-IN forms
+    # (``${env.X}`` is universal, ``${profile.X.Y}`` reads profiles.yml);
+    # the new ``secret://`` form is the extensibility surface so a manager
+    # ships as a plugin without an engine change. See :mod:`dtex.secrets`.
+    # ``ClassVar`` — true class constants, excluded from the dataclass fields.
+    ENV_PREFIX: ClassVar[str] = "${env."
+    PROFILE_PREFIX: ClassVar[str] = "${profile."
+    SECRET_URL_PREFIX: ClassVar[str] = "secret://"
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SecretRef:
+        """Build a :class:`SecretRef` from a parsed YAML mapping — docs/03 §2.5."""
+        known = {"name", "ref", "optional"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"unknown secret key(s): {', '.join(sorted(unknown))}")
+        if "name" not in data:
+            raise ValueError("secret requires a 'name'")
+        if "ref" not in data:
+            raise ValueError(f"secret {data['name']!r} requires a 'ref'")
+        ref = str(data["ref"])
+        if not cls.is_valid_ref(ref):
+            raise ValueError(
+                f"secret {data['name']!r} ref {ref!r} must use a known resolver: "
+                f"${{env.X}}, ${{profile.X.Y}}, or secret://<scheme>/<path>[#<field>]"
+            )
+        optional = data.get("optional", False)
+        if not isinstance(optional, bool):
+            raise ValueError(f"secret {data['name']!r} optional must be true or false")
+        return cls(name=str(data["name"]), ref=ref, optional=optional)
+
+    @classmethod
+    def is_valid_ref(cls, ref: str) -> bool:
+        """Whether ``ref`` uses one of the three supported resolver forms.
+
+        This is the syntax check the engine applies at discovery (docs/03 §7
+        step 5: "every ``secrets[].ref`` uses a known resolver form").
+
+        Three forms accepted (stage 9a):
+
+        * ``${env.X}`` — read environment variable ``X`` (universal, built-in).
+        * ``${profile.X.Y}`` — read profiles.yml key (built-in).
+        * ``secret://<scheme>/<path>[#<field>]`` — pluggable secret manager
+          (docs/08 §3; the registered resolvers, not the URL syntax, are
+          plugin-loaded). The deep URL grammar (valid scheme characters,
+          non-empty path) is validated at resolution time by
+          :func:`dtex.secrets.resolve_secret_url` — this surface check only
+          gates the prefix so an obvious typo (``vault:/foo``) fails at
+          discovery with a clear hint.
+        """
+        ref = ref.strip()
+        if ref.startswith(cls.SECRET_URL_PREFIX):
+            return True
+        if not ref.endswith("}"):
+            return False
+        return ref.startswith(cls.ENV_PREFIX) or ref.startswith(cls.PROFILE_PREFIX)
+
+
+_LOOKBACK_UNITS: dict[str, int] = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+_LOOKBACK_RE = re.compile(r"^\s*(\d+)\s*([smhdw])?\s*$")
+
+
+def parse_lookback(text: str, cursor_type: CursorType) -> timedelta | int:
+    """Parse an ``incremental.lookback`` duration for a cursor type — docs/03 §2.2.
+
+    Grammar: ``<int><unit>`` with unit ``s`` / ``m`` / ``h`` / ``d`` / ``w``
+    (``"2d"``, ``"6h"``, ``"30m"``). The result the engine subtracts from the
+    persisted cursor before handing it to the stream:
+
+    * ``timestamp`` / ``date`` cursors — a :class:`~datetime.timedelta` (a
+      ``date`` cursor rounds a sub-day duration up to one day);
+    * ``int`` cursors — an integer: a bare number (``"100"``) is subtracted
+      as-is, a unit suffix is converted to SECONDS (``"6h"`` → 21600) because
+      an int cursor is almost always a Unix timestamp (Stripe's ``created``);
+    * ``string`` cursors have no arithmetic — declaring a lookback is an
+      error at discovery time.
+    """
+    match = _LOOKBACK_RE.match(str(text))
+    if match is None:
+        raise ValueError(
+            f"invalid lookback {text!r}: expected <int><unit> with unit s/m/h/d/w (e.g. '2d', '6h')"
+        )
+    amount, unit = int(match.group(1)), match.group(2)
+    if cursor_type is CursorType.STRING:
+        raise ValueError("lookback is not supported on a string cursor (no arithmetic)")
+    if cursor_type is CursorType.INT:
+        return amount * _LOOKBACK_UNITS[unit] if unit else amount
+    if unit is None:
+        raise ValueError(
+            f"invalid lookback {text!r}: a {cursor_type.value} cursor needs a unit "
+            "(e.g. '2d', '6h')"
+        )
+    seconds = amount * _LOOKBACK_UNITS[unit]
+    if cursor_type is CursorType.DATE:
+        return timedelta(days=max(1, -(-seconds // 86400)))
+    return timedelta(seconds=seconds)
+
+
+def parse_duration(text: str) -> timedelta:
+    """Parse a wall-clock duration — ``incremental.max_staleness``, docs/03 §2.2.
+
+    Same ``<int><unit>`` grammar as :func:`parse_lookback` (``"35d"``,
+    ``"6h"``, ``"90m"``) but always a :class:`~datetime.timedelta`, and the
+    unit is REQUIRED: this measures elapsed real time, so a bare number has no
+    defensible reading. Unlike a lookback it does not vary by cursor type — an
+    int cursor's units are the source's business, while staleness is always
+    measured against the clock.
+    """
+    match = _LOOKBACK_RE.match(str(text))
+    if match is None or match.group(2) is None:
+        raise ValueError(
+            f"invalid duration {text!r}: expected <int><unit> with unit "
+            f"s/m/h/d/w (e.g. '35d', '6h')"
+        )
+    seconds = int(match.group(1)) * _LOOKBACK_UNITS[match.group(2)]
+    if seconds <= 0:
+        raise ValueError(f"invalid duration {text!r}: must be greater than zero")
+    return timedelta(seconds=seconds)
+
+
+@dataclass(frozen=True)
+class Incremental:
+    """A stream's cursor-based incremental config — mirrors ``register.yaml``.
+
+    docs/03 §2.2 "The ``incremental`` block". Absence of this block on a stream
+    means a full table is fetched every run.
+
+    ``lookback`` is applied BY THE ENGINE: ``cursor.start_value()`` on a
+    resumed run is the persisted cursor minus the lookback (see
+    :func:`parse_lookback`), never on the first run's ``initial_value`` or an
+    explicit ``since:`` override. ``ordered`` declares that the stream yields
+    records in non-decreasing cursor order; only then may the engine persist
+    the observed cursor at a mid-stream flush (a crash resumes from the last
+    durable batch). An unordered stream (the default — a per-object walk, a
+    fan-out over posts, anything that revisits older values late) keeps the
+    PRIOR cursor at every mid-stream flush and advances it only when the
+    stream completes, so a failed run cannot skip the rows it never reached.
+
+    ``max_staleness`` declares how far this stream's cursor may fall behind the
+    wall clock before an operator should treat it as stuck — the stream's
+    NATURAL GRAIN as a duration, in the same ``<int><unit>`` grammar as
+    ``lookback``. dtex never acts on it: nothing is retried, delayed or failed
+    because of it. It exists so monitoring can ask each stream what "late"
+    means for IT, instead of applying one project-wide threshold to streams
+    whose cadences differ by orders of magnitude — a monthly report (``35d``)
+    and a half-hourly insights stream (``2h``) otherwise cannot share a config
+    without the alert on one being noise for the other.
+
+    Omitted (the default) means the stream declares no opinion and monitoring
+    should fall back to its own default. ``dtex state list --stale`` reports
+    each stream against this value and exits non-zero if any has exceeded it.
+    """
+
+    cursor_field: str
+    cursor_type: CursorType = CursorType.TIMESTAMP
+    lookback: str | None = None
+    initial_value: str | None = None
+    ordered: bool = False
+    max_staleness: str | None = None
+
+    def lookback_delta(self) -> timedelta | int | None:
+        """The parsed lookback (``None`` when not declared) — see :func:`parse_lookback`."""
+        if self.lookback is None:
+            return None
+        return parse_lookback(self.lookback, self.cursor_type)
+
+    def max_staleness_delta(self) -> timedelta | None:
+        """The parsed ``max_staleness`` (``None`` when not declared).
+
+        Always a :class:`~datetime.timedelta`: staleness is elapsed real time,
+        so unlike ``lookback`` it does not vary by cursor type.
+        """
+        if self.max_staleness is None:
+            return None
+        return parse_duration(self.max_staleness)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Incremental:
+        """Build an :class:`Incremental` from a parsed YAML mapping — docs/03 §2.2."""
+        known = {
+            "cursor_field",
+            "cursor_type",
+            "lookback",
+            "initial_value",
+            "ordered",
+            "max_staleness",
+        }
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"unknown incremental key(s): {', '.join(sorted(unknown))}")
+        if "cursor_field" not in data:
+            raise ValueError("incremental block requires a 'cursor_field'")
+        lookback = data.get("lookback")
+        initial = data.get("initial_value")
+        ordered = data.get("ordered", False)
+        staleness = data.get("max_staleness")
+        if not isinstance(ordered, bool):
+            raise ValueError(f"incremental 'ordered' must be a boolean, got {ordered!r}")
+        inc = cls(
+            cursor_field=str(data["cursor_field"]),
+            cursor_type=CursorType.parse(data.get("cursor_type", CursorType.TIMESTAMP)),
+            lookback=None if lookback is None else str(lookback),
+            initial_value=None if initial is None else str(initial),
+            ordered=ordered,
+            max_staleness=None if staleness is None else str(staleness),
+        )
+        inc.lookback_delta()  # validate at discovery time, not at run time
+        inc.max_staleness_delta()  # ditto
+        return inc
+
+
+@dataclass(frozen=True)
+class SigmaConfig:
+    """Stream-level Sigma config — present iff this stream runs Sigma SQL.
+
+    A small marker block on a :class:`StreamDef` that opts an individual
+    stream into Stripe Sigma's SQL-as-stream model (the rest of the
+    connector's streams continue using whatever default surface the
+    connector implements — for the baked ``stripe`` connector, that's
+    REST).
+
+    A connector that supports Sigma checks ``stream_def.sigma is not None``
+    inside its ``@stream`` function and dispatches to its Sigma helper if
+    set, REST helper otherwise. Connectors with no Sigma support simply
+    never see this block on their streams.
+
+    Fields:
+
+    * ``query`` — path to the .sql file (relative to the connector folder)
+      whose body is submitted as the Sigma query. The cursor floor is
+      bound into the SQL by the connector (canonical placeholder:
+      ``{since}``).
+    """
+
+    query: str
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SigmaConfig:
+        """Build a :class:`SigmaConfig` from a parsed YAML mapping."""
+        known = {"query"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(
+                f"sigma: unknown key(s) {sorted(unknown)}; valid: {sorted(known)}"
+            )
+        if "query" not in data:
+            raise ValueError("sigma: 'query' is required (path to the .sql file)")
+        return cls(query=str(data["query"]))
+
+
+@dataclass(frozen=True)
+class GaqlConfig:
+    """Stream-level GAQL config — present iff this stream runs a GAQL query.
+
+    The Google Ads analogue of :class:`SigmaConfig`. A small marker block on
+    a :class:`StreamDef` that opts an individual stream into the Google Ads
+    Query Language (GAQL) query-as-stream model: the baked ``gads`` connector
+    submits the named ``.gaql`` file's body to the GoogleAdsService
+    ``searchStream`` endpoint and yields each ``GoogleAdsRow`` as a record.
+
+    A connector that supports GAQL checks ``stream_def.gaql is not None``
+    inside its ``@stream`` function and dispatches to its GAQL helper if set.
+    Connectors with no GAQL support simply never see this block on their
+    streams.
+
+    Fields:
+
+    * ``query`` — path to the .gaql file (relative to the connector folder)
+      whose body is submitted as the GAQL query. The incremental date floor
+      is bound into the query body by the connector (canonical placeholders:
+      ``{since}`` / ``{until}``).
+    """
+
+    query: str
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> GaqlConfig:
+        """Build a :class:`GaqlConfig` from a parsed YAML mapping."""
+        known = {"query"}
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(
+                f"gaql: unknown key(s) {sorted(unknown)}; valid: {sorted(known)}"
+            )
+        if "query" not in data:
+            raise ValueError("gaql: 'query' is required (path to the .gaql file)")
+        return cls(query=str(data["query"]))
+
+
+@dataclass(frozen=True)
+class StreamDef:
+    """One declared output table — mirrors a ``register.yaml`` ``streams[]`` entry.
+
+    docs/03 §2.2. This is the static *declaration* of a stream; the matching
+    ``@stream`` function in the connector body is its *implementation*.
+    """
+
+    name: str
+    table: str
+    primary_key: tuple[str, ...] = ()
+    write_disposition: WriteDisposition = WriteDisposition.APPEND
+    incremental: Incremental | None = None
+    schema: Schema | None = None
+    partition_by: str | PartitionConfig | None = None
+    sigma: SigmaConfig | None = None
+    """Stream-level Sigma config — present iff this stream runs Sigma SQL
+    instead of the connector's default extraction surface (see
+    :class:`SigmaConfig` for the rationale). Absent on every existing
+    stream; this is purely an opt-in extension."""
+    gaql: GaqlConfig | None = None
+    """Stream-level GAQL config — present iff this stream runs a Google Ads
+    Query Language query (see :class:`GaqlConfig`). Absent on every stream
+    that doesn't use the ``gads`` connector's GAQL surface; opt-in only."""
+    """The declared partition spec, either:
+
+    * a bare string column name (short form — defaults to TIME+DAY at
+      resolution time), or
+    * a fully-typed :class:`PartitionConfig` (long form parsed by
+      :meth:`from_dict`), or
+    * ``None`` (no declaration — the engine may compute a cursor-based
+      auto-default at run time).
+
+    # NOTE: kept as ``str | PartitionConfig`` (not auto-promoted to
+    # ``PartitionConfig`` at parse time) so the engine can defer the
+    # short-form interpretation until it has the cursor type + the per-config
+    # override in hand — the cursor info isn't available here, and the engine
+    # *needs* to know whether the field was set as a bare string vs a long-form
+    # config to apply the backward-compat degradation rule (see the resolver's
+    # NOTE in :mod:`dtex.engine.runner`)."""
+    params: Mapping[str, ParamSpec] = field(default_factory=dict)
+    schema_contract: SchemaContract = SchemaContract.EVOLVE
+    discover: bool = False
+    """``discover: true`` in ``register.yaml`` marks this entry as a stream
+    *template*: at run time the connector's ``@discover(stream=<name>)`` hook
+    expands it into zero or more concrete streams (one per spreadsheet tab, for
+    example), each inheriting every other key of this entry. See docs/03 §2.2.3
+    and :class:`DiscoveredStream`."""
+    discovered_from: str | None = None
+    """Runtime-only: the template stream a discovered stream was expanded from
+    (``None`` on every declared stream). The engine runs a discovered stream
+    with its template's ``@stream`` function. Never parsed from YAML."""
+    context: Mapping[str, Any] = field(default_factory=dict)
+    """Runtime-only: the discovery hook's per-stream context (e.g. the tab's
+    id and title), read by the template's ``@stream`` function through the
+    injected ``stream_def``. Empty on every declared stream."""
+
+    def __post_init__(self) -> None:
+        """Enforce stream-level integrity rules — docs/03 §7 step 4.
+
+        ``merge`` requires a ``primary_key``; if both a ``schema`` and an
+        ``incremental`` block are present, ``cursor_field`` must appear in the
+        schema.
+        """
+        if self.write_disposition is WriteDisposition.MERGE and not self.primary_key:
+            raise ValueError(
+                f"stream {self.name!r}: write_disposition 'merge' requires a primary_key"
+            )
+        if self.incremental is not None and self.schema is not None:
+            cf = self.incremental.cursor_field
+            if not self.schema.has(cf):
+                raise ValueError(
+                    f"stream {self.name!r}: incremental cursor_field {cf!r} "
+                    f"is not in the declared schema"
+                )
+
+    @property
+    def is_incremental(self) -> bool:
+        """Whether this stream declares an ``incremental`` block — docs/03 §3.2.
+
+        Drives whether the engine injects a :class:`Cursor` into the ``@stream``
+        function.
+        """
+        return self.incremental is not None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> StreamDef:
+        """Build a :class:`StreamDef` from a parsed YAML mapping — docs/03 §2.2."""
+        known = {
+            "name",
+            "table",
+            "primary_key",
+            "write_disposition",
+            "incremental",
+            "schema",
+            "partition_by",
+            "sigma",
+            "gaql",
+            "params",
+            "schema_contract",
+            "discover",
+        }
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"unknown stream key(s): {', '.join(sorted(unknown))}")
+        if "name" not in data:
+            raise ValueError("stream requires a 'name'")
+        name = str(data["name"])
+
+        pk_raw = data.get("primary_key")
+        if pk_raw is None:
+            primary_key: tuple[str, ...] = ()
+        elif isinstance(pk_raw, str):
+            primary_key = (pk_raw,)
+        elif isinstance(pk_raw, (list, tuple)):
+            primary_key = tuple(str(k) for k in pk_raw)
+        else:
+            raise ValueError(f"stream {name!r}: primary_key must be a string or list")
+
+        incremental_raw = data.get("incremental")
+        incremental = (
+            Incremental.from_dict(incremental_raw) if incremental_raw is not None else None
+        )
+
+        params_raw = data.get("params") or {}
+        params = {k: ParamSpec.from_dict(v) for k, v in params_raw.items()}
+
+        sigma_raw = data.get("sigma")
+        if sigma_raw is None:
+            sigma_block: SigmaConfig | None = None
+        elif isinstance(sigma_raw, Mapping):
+            try:
+                sigma_block = SigmaConfig.from_dict(sigma_raw)
+            except ValueError as exc:
+                raise ValueError(f"stream {name!r}: {exc}") from exc
+        else:
+            raise ValueError(
+                f"stream {name!r}: 'sigma' must be a mapping; "
+                f"got {type(sigma_raw).__name__}"
+            )
+
+        gaql_raw = data.get("gaql")
+        if gaql_raw is None:
+            gaql_block: GaqlConfig | None = None
+        elif isinstance(gaql_raw, Mapping):
+            try:
+                gaql_block = GaqlConfig.from_dict(gaql_raw)
+            except ValueError as exc:
+                raise ValueError(f"stream {name!r}: {exc}") from exc
+        else:
+            raise ValueError(
+                f"stream {name!r}: 'gaql' must be a mapping; "
+                f"got {type(gaql_raw).__name__}"
+            )
+
+        return cls(
+            name=name,
+            table=str(data.get("table", name)),
+            primary_key=primary_key,
+            write_disposition=WriteDisposition.parse(
+                data.get("write_disposition", WriteDisposition.APPEND)
+            ),
+            incremental=incremental,
+            schema=Schema.from_list(data.get("schema")),
+            partition_by=_parse_partition_by(data.get("partition_by")),
+            sigma=sigma_block,
+            gaql=gaql_block,
+            params=params,
+            schema_contract=SchemaContract.parse(
+                data.get("schema_contract", SchemaContract.EVOLVE)
+            ),
+            discover=_parse_discover_flag(name, data.get("discover", False)),
+        )
+
+
+def _parse_discover_flag(stream_name: str, value: Any) -> bool:
+    """Validate a stream's ``discover:`` key — a YAML boolean, nothing else."""
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"stream {stream_name!r}: 'discover' must be a boolean, got {value!r}"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class DiscoveredStream:
+    """One concrete stream a ``@discover`` hook found at run time — docs/03 §2.2.3.
+
+    Returned (as an iterable) by a connector's ``@discover(stream=<template>)``
+    hook. The engine turns each into a :class:`StreamDef` that copies the
+    template's declaration (disposition, primary key, incremental block,
+    schema, …) and overrides only:
+
+    * ``name`` — the stream name: what a config's ``streams:`` block and
+      ``--select`` name, and the ``_dtex_state`` key. Must be stable across
+      runs for the same underlying object, or state and table names drift.
+    * ``table`` — the destination table; defaults to ``name``.
+    * ``context`` — free-form, JSON-able facts the template's ``@stream``
+      function needs to read this particular stream (``stream_def.context``).
+    """
+
+    name: str
+    table: str | None = None
+    context: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Reject an empty or non-string stream name."""
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError(f"a discovered stream needs a non-empty name, got {self.name!r}")
+        if self.table is not None and (not isinstance(self.table, str) or not self.table):
+            raise ValueError(
+                f"discovered stream {self.name!r}: table must be a non-empty string"
+            )
+
+
+@dataclass(frozen=True)
+class StreamMeta:
+    """The per-stream metadata a destination hook needs to write one stream.
+
+    docs/05 §1 / docs/03 §3.4. The engine builds one ``StreamMeta`` per stream
+    from the resolved :class:`StreamDef` and passes it to ``write_batch`` and
+    ``ensure_schema``. It is the *single* metadata object those hooks receive —
+    new per-stream concerns are added as fields here, never as new hook
+    keyword arguments, so the destination contract stays stable as the engine
+    grows. ``schema`` is the resolved, ready-to-write schema (engine-inferred
+    when the stream declares none), distinct from :class:`StreamDef`'s optional
+    declared schema.
+    """
+
+    table: str
+    write_disposition: WriteDisposition
+    schema: Schema
+    primary_key: tuple[str, ...] = ()
+    partition: PartitionConfig | None = None
+    """The resolved physical-partition spec for this stream — docs/05 §3.x.
+
+    Built by the engine from (in precedence order) a per-config
+    ``partition_overrides`` entry, the source stream's
+    :attr:`StreamDef.partition_by`, or the cursor-based auto-default; ``None``
+    means "leave the table unpartitioned". Destinations that lack native
+    partitioning (DuckDB) ignore this field — see their ``ensure_schema``
+    NOTE for the rationale."""
+    schema_contract: SchemaContract = SchemaContract.EVOLVE
+
+    @classmethod
+    def from_stream_def(
+        cls,
+        stream: StreamDef,
+        schema: Schema,
+        *,
+        partition: PartitionConfig | None = None,
+    ) -> StreamMeta:
+        """Build a :class:`StreamMeta` from a :class:`StreamDef` plus a resolved schema.
+
+        ``schema`` is the engine's resolved schema for the stream — the declared
+        one when present, otherwise the inferred one. ``partition`` is the
+        engine-resolved :class:`PartitionConfig` (or ``None``) — the runner
+        computes it from the source declaration, the per-config override and
+        the cursor-based auto-default, then passes it in here so the
+        destination contract sees a single resolved value rather than three
+        sources to reconcile. Every other field is copied straight from the
+        declaration.
+
+        # NOTE: ``partition`` is keyword-only and defaults to ``None`` for two
+        # reasons: (1) older call sites (and tests) that build a
+        # :class:`StreamMeta` directly via this constructor stay source-
+        # compatible — they simply get the "no partition" behavior the
+        # destination already understands; (2) the runner is the single place
+        # that resolves the three precedence layers, so making ``partition``
+        # the runner's job (not this helper's) keeps the resolution logic in
+        # one file.
+        """
+        return cls(
+            table=stream.table,
+            write_disposition=stream.write_disposition,
+            schema=schema,
+            primary_key=stream.primary_key,
+            partition=partition,
+            schema_contract=stream.schema_contract,
+        )
+
+
+@dataclass(frozen=True)
+class DestinationBinding:
+    """Where a source's streams land — mirrors ``register.yaml`` ``destination``.
+
+    docs/03 §2.3. ``connector`` names a ``kind: destination`` connector; any
+    other keys are free-form routing params (e.g. ``dataset``) whose meaning is
+    defined by that destination's own ``register.yaml``. The binding never
+    names a project, host, or credential — those are environment concerns.
+
+    # NOTE: as of build stage 8.B, ``DestinationBinding`` is *no longer* part of
+    # the source contract — the source's ``register.yaml`` may not declare a
+    # ``destination:`` block, and the project picks the destination via a
+    # ``configs/<name>.yml`` file instead (docs/06, docs/12). The dataclass is
+    # kept so older fixtures and external authors who still carry a
+    # ``destination:`` block parse without error; the engine logs a warning when
+    # it encounters one and otherwise ignores it. The field is expected to be
+    # removed in a later stage.
+    """
+
+    connector: str
+    routing: Mapping[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> DestinationBinding:
+        """Build a :class:`DestinationBinding` from a parsed YAML mapping — docs/03 §2.3."""
+        if "connector" not in data:
+            raise ValueError("destination binding requires a 'connector'")
+        routing = {k: v for k, v in data.items() if k != "connector"}
+        return cls(connector=str(data["connector"]), routing=routing)
+
+
+@dataclass(frozen=True)
+class ConnectorManifest:
+    """The parsed ``register.yaml`` — the connector discovery manifest.
+
+    docs/03 §2.1. Carries exactly the eleven top-level keys the handbook
+    fixes: ``name, kind, version, summary, tags, streams, destination,
+    params, secrets, schedule, requires``. A ``kind: destination`` manifest
+    uses the same eleven minus ``streams``/``destination``.
+    """
+
+    name: str
+    kind: ConnectorKind
+    version: str = "0.1.0"
+    summary: str = ""
+    tags: tuple[str, ...] = ()
+    streams: tuple[StreamDef, ...] = ()
+    destination: DestinationBinding | None = None
+    params: Mapping[str, ParamSpec] = field(default_factory=dict)
+    secrets: tuple[SecretRef, ...] = ()
+    schedule: str | None = None
+    requires: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Enforce ``kind``-consistency and stream-name uniqueness — docs/03 §7.
+
+        Step 3 (kind consistency): ``source`` ⇒ ``streams`` non-empty;
+        ``destination`` ⇒ no ``streams`` and no ``destination`` binding.
+        Step 4 (stream integrity): stream ``name``s must be unique.
+        """
+        if self.kind is ConnectorKind.SOURCE:
+            if not self.streams:
+                raise ValueError(
+                    f"connector {self.name!r}: kind 'source' requires a non-empty 'streams'"
+                )
+        else:  # ConnectorKind.DESTINATION
+            if self.streams:
+                raise ValueError(
+                    f"connector {self.name!r}: kind 'destination' must not declare 'streams'"
+                )
+            if self.destination is not None:
+                raise ValueError(
+                    f"connector {self.name!r}: kind 'destination' must not declare a "
+                    f"'destination' binding"
+                )
+        seen: set[str] = set()
+        for s in self.streams:
+            if s.name in seen:
+                raise ValueError(
+                    f"connector {self.name!r}: duplicate stream name {s.name!r}"
+                )
+            seen.add(s.name)
+
+    def stream(self, name: str) -> StreamDef | None:
+        """Look up a declared stream by name; ``None`` if absent."""
+        for s in self.streams:
+            if s.name == name:
+                return s
+        return None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ConnectorManifest:
+        """Build a :class:`ConnectorManifest` from a parsed ``register.yaml``.
+
+        Enforces docs/03 §7 step 2: every top-level key is known (unknown keys
+        are a hard error, catching typos like ``write_dispostion``) and every
+        required key is present.
+        """
+        known = {
+            "name",
+            "kind",
+            "version",
+            "summary",
+            "tags",
+            "streams",
+            "destination",
+            "params",
+            "secrets",
+            "schedule",
+            "requires",
+        }
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(
+                f"unknown register.yaml key(s): {', '.join(sorted(unknown))}"
+            )
+        if "name" not in data:
+            raise ValueError("register.yaml requires a 'name'")
+        if "kind" not in data:
+            raise ValueError(f"connector {data['name']!r}: register.yaml requires a 'kind'")
+
+        tags_raw = data.get("tags") or []
+        requires_raw = data.get("requires") or []
+        streams_raw = data.get("streams") or []
+        params_raw = data.get("params") or {}
+        secrets_raw = data.get("secrets") or []
+        dest_raw = data.get("destination")
+        schedule = data.get("schedule")
+
+        return cls(
+            name=str(data["name"]),
+            kind=ConnectorKind.parse(data["kind"]),
+            version=str(data.get("version", "0.1.0")),
+            summary=str(data.get("summary", "")),
+            tags=tuple(str(t) for t in tags_raw),
+            streams=tuple(StreamDef.from_dict(s) for s in streams_raw),
+            destination=(
+                DestinationBinding.from_dict(dest_raw) if dest_raw is not None else None
+            ),
+            params={k: ParamSpec.from_dict(v) for k, v in params_raw.items()},
+            secrets=tuple(SecretRef.from_dict(s) for s in secrets_raw),
+            schedule=None if schedule is None else str(schedule),
+            requires=tuple(str(r) for r in requires_raw),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Runtime types — passed to connector code at run time
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Config:
+    """Resolved, immutable params + secrets handed to connector code — docs/03 §3, §6.
+
+    The engine resolves every config layer (register.yaml defaults → profiles →
+    project → CLI/run kwargs), type-checks each value, resolves secret refs, and
+    hands the connector body this single immutable object. The connector never
+    parses YAML, reads env vars, or touches files itself.
+
+    Access patterns (docs/03 §3 "Injected arguments"):
+
+    * ``config.page_size`` — attribute access reads a resolved *param*. This is
+      sugar for ``config.params["page_size"]``.
+    * ``config.secrets["api_token"]`` — secrets are read by explicit subscript,
+      never as attributes, so secret access always reads as such in connector
+      code (and is harder to leak by an accidental ``repr``).
+    """
+
+    params: Mapping[str, Any] = field(default_factory=dict)
+    secrets: Mapping[str, str] = field(default_factory=dict)
+
+    def __getattr__(self, name: str) -> Any:
+        """Resolve an unknown attribute as a param — ``config.page_size``.
+
+        # NOTE: ``__getattr__`` runs only when normal lookup fails, so the
+        # real ``params``/``secrets`` fields are never shadowed. A missing
+        # param raises :class:`AttributeError` (not ``KeyError``) so it behaves
+        # like any other attribute miss and so ``hasattr`` works as expected.
+        """
+        try:
+            params: Mapping[str, Any] = object.__getattribute__(self, "params")
+        except AttributeError:  # during unpickling / partial init
+            raise AttributeError(name) from None
+        if name in params:
+            return params[name]
+        raise AttributeError(f"Config has no param {name!r}")
+
+    def get(self, name: str, default: Any = None) -> Any:
+        """Return a resolved param value, or ``default`` if it is not set."""
+        return self.params.get(name, default)
+
+    def has_secret(self, name: str) -> bool:
+        """Whether a secret of this logical name was resolved."""
+        return name in self.secrets
+
+
+class State:
+    """Per-stream persisted key/value scratch space — docs/03 §3, docs/04.
+
+    Free-form, *untyped* memory that survives between runs. The connector reads
+    and writes it freely; the engine persists its contents as the
+    ``state_blob`` JSON column of ``_dtex_state`` after batches durably
+    land. Scoped per ``(connector, stream)``.
+
+    Unlike :class:`Cursor` (the *typed* incremental slice), ``State`` holds
+    anything else a stream must remember — a vendor pagination token, a
+    high-water id the API exposes instead of a timestamp.
+
+    # NOTE: ``State`` is intentionally *not* frozen — connector code mutates it.
+    # It is a thin dict wrapper rather than a bare dict so the engine can
+    # snapshot it (``to_dict``) and detect changes without exposing internals.
+    """
+
+    def __init__(self, initial: Mapping[str, Any] | None = None) -> None:
+        """Create state, optionally seeded from a prior run's ``state_blob``."""
+        self._data: dict[str, Any] = dict(initial or {})
+
+    def __getitem__(self, key: str) -> Any:
+        """Read a state value; raises :class:`KeyError` if absent."""
+        return self._data[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Write a state value (must be JSON-serializable for persistence)."""
+        self._data[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        """Remove a state value."""
+        del self._data[key]
+
+    def __contains__(self, key: str) -> bool:
+        """Whether a key is present in state."""
+        return key in self._data
+
+    def __len__(self) -> int:
+        """Number of stored keys."""
+        return len(self._data)
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterate stored keys."""
+        return iter(self._data)
+
+    def __eq__(self, other: object) -> bool:
+        """Two :class:`State` objects are equal when their contents match."""
+        if isinstance(other, State):
+            return self._data == other._data
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        """Developer-readable representation listing the stored keys."""
+        return f"State({self._data!r})"
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Read a state value, or ``default`` if the key is absent."""
+        return self._data.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        """Write a state value — the imperative form of ``state[key] = value``."""
+        self._data[key] = value
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a shallow copy of the state contents for persistence."""
+        return dict(self._data)
+
+
+class Cursor:
+    """The incremental cursor helper injected into ``@stream`` — docs/03 §3.2.
+
+    A ``Cursor`` is present only for streams that declare an ``incremental``
+    block. It turns incremental loading into a three-line affair: read the
+    resume point with :meth:`start_value`, report each record's cursor value
+    with :meth:`observe`, and the engine persists the observed max after the
+    batches durably land. The connector never writes cursor state itself.
+
+    # NOTE: ``Cursor`` is deliberately *dumb*. ``start_value()`` returns
+    # whatever the engine handed in at construction — the engine has already
+    # applied the ``lookback`` subtraction and ``initial_value`` fallback
+    # (parsing ``"2d"`` etc. is engine work, not a contract-type concern, per
+    # docs/03 §3.2). The Cursor only tracks the observed max for the engine to
+    # read back after the generator is exhausted.
+    """
+
+    def __init__(
+        self,
+        cursor_field: str,
+        cursor_type: CursorType,
+        start_value: Any = None,
+        is_full_refresh: bool = False,
+    ) -> None:
+        """Create a cursor for one stream.
+
+        ``start_value`` is the engine-computed resume point (last committed
+        cursor minus lookback, or ``initial_value`` on the first run, or
+        ``None`` under ``--full-refresh``).
+        """
+        self._cursor_field = cursor_field
+        self._cursor_type = cursor_type
+        self._start_value = start_value
+        self._is_full_refresh = is_full_refresh
+        self._observed_max: Any = None
+        self._observed_any = False
+
+    @property
+    def cursor_field(self) -> str:
+        """The record field this cursor tracks (e.g. ``created_date``)."""
+        return self._cursor_field
+
+    @property
+    def cursor_type(self) -> CursorType:
+        """How this cursor's values are compared and stored."""
+        return self._cursor_type
+
+    @property
+    def is_full_refresh(self) -> bool:
+        """``True`` when the run was invoked with ``--full-refresh`` — docs/03 §3.2."""
+        return self._is_full_refresh
+
+    def start_value(self) -> Any:
+        """Where to resume — docs/03 §3.2.
+
+        The last persisted cursor value minus ``lookback``, or
+        ``incremental.initial_value`` on the first run. ``None`` under
+        ``--full-refresh`` (start from the beginning).
+        """
+        if self._is_full_refresh:
+            return None
+        return self._start_value
+
+    def observe(self, value: Any) -> None:
+        """Report a record's cursor-field value — docs/03 §3.2.
+
+        The engine tracks the maximum across every observed value; that maximum
+        becomes the next run's resume point once the batches durably land.
+        ``None`` values are ignored (a record missing its cursor field must not
+        drag the cursor backward).
+        """
+        if value is None:
+            return
+        if not self._observed_any or value > self._observed_max:
+            self._observed_max = value
+            self._observed_any = True
+
+    @property
+    def observed_max(self) -> Any:
+        """The maximum value seen via :meth:`observe`; ``None`` if none observed.
+
+        Read by the engine after the ``@stream`` generator is exhausted, to
+        persist as the new cursor value.
+        """
+        return self._observed_max
+
+
+@runtime_checkable
+class StateBackend(Protocol):
+    """The state-I/O contract for Tier-B destinations — docs/05 §5.4.
+
+    Object-storage destinations cannot host the ``_dtex_state`` table, so
+    the engine routes state through a companion backend implementing this
+    Protocol. A destination's ``@destination.state_backend`` hook returns one
+    (or ``None`` when the destination is Tier A and is its own backend).
+    """
+
+    def read_state(self, connector: str) -> list[StateRecord]:
+        """Load every prior :class:`StateRecord` for a connector at run start."""
+        ...
+
+    def commit_state(self, run_id: str, records: list[StateRecord]) -> None:
+        """Persist the run's :class:`StateRecord` set after all batches land."""
+        ...
+
+
+@dataclass
+class StateRecord:
+    """One ``_dtex_state`` row — the per-stream resume point.
+
+    Passed between the engine and a destination's ``read_state`` /
+    ``commit_state`` hooks. Primary key is ``(connector, stream)``.
+
+    # NOTE: docs/03 §3.5 and docs/05 §5.1 originally gave *different* column
+    # sets. The canonical schema is their merged union — eight columns:
+    # connector, stream, cursor_value, cursor_type, state_blob, last_run_id,
+    # rows_total, updated_at. ``cursor_field`` (docs/05) is excluded — it is
+    # recoverable from the stream's manifest. ``last_run_at`` (docs/03) is
+    # excluded — it is recoverable by joining ``_dtex_runs`` on
+    # ``last_run_id``. Every retained column is load-bearing: ``cursor_type``
+    # is required to deserialize ``cursor_value`` correctly, ``last_run_id``
+    # links state to the run record's audit chain, ``state_blob`` persists the
+    # per-stream ``State`` scratch space. This module is now the source of
+    # truth; docs/03 §3.5 and docs/05 §5.1-5.2 follow it.
+
+    # NOTE: not frozen because the engine advances ``rows_total`` /
+    # ``updated_at`` in place across a run; a frozen variant would force a
+    # rebuild per stream. Round-trips via ``to_row`` / ``from_row`` are the
+    # persistence boundary.
+    """
+
+    connector: str
+    stream: str
+    cursor_value: Any = None
+    cursor_type: CursorType | None = None
+    state_blob: Mapping[str, Any] = field(default_factory=dict)
+    last_run_id: str | None = None
+    rows_total: int = 0
+    updated_at: datetime | None = None
+
+    def to_row(self) -> dict[str, Any]:
+        """Serialize to a plain dict matching the ``_dtex_state`` columns.
+
+        ``cursor_type`` becomes its string value; timestamps become ISO-8601
+        strings; this is the JSON-friendly shape a destination writes.
+        """
+        return {
+            "connector": self.connector,
+            "stream": self.stream,
+            "cursor_value": self.cursor_value,
+            "cursor_type": None if self.cursor_type is None else self.cursor_type.value,
+            "state_blob": dict(self.state_blob),
+            "last_run_id": self.last_run_id,
+            "rows_total": self.rows_total,
+            "updated_at": None if self.updated_at is None else self.updated_at.isoformat(),
+        }
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> StateRecord:
+        """Deserialize a ``_dtex_state`` row read back from a destination.
+
+        Inverse of :meth:`to_row`. ``cursor_type`` and timestamps are parsed
+        back into their typed forms; absent optional columns become ``None``.
+        """
+        ct = row.get("cursor_type")
+        return cls(
+            connector=str(row["connector"]),
+            stream=str(row["stream"]),
+            cursor_value=row.get("cursor_value"),
+            cursor_type=None if ct is None else CursorType.parse(ct),
+            state_blob=dict(row.get("state_blob") or {}),
+            last_run_id=None if row.get("last_run_id") is None else str(row["last_run_id"]),
+            rows_total=int(row.get("rows_total") or 0),
+            updated_at=_parse_dt(row.get("updated_at")),
+        )
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    """Parse a timestamp column back into a :class:`datetime` (or ``None``)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
+
+
+# The default staleness threshold for a stream lease — docs/05 §5.5. A lease
+# whose ``heartbeat_at`` is older than this is considered dead (the holding
+# build crashed without releasing) and is reclaimable by a new acquire. 900s
+# (15 min) is comfortably longer than the between-batch heartbeat interval
+# (:data:`LEASE_HEARTBEAT_INTERVAL_SECONDS`) so a healthy but slow stream — one
+# whose single page takes minutes — is never mistaken for dead, yet short
+# enough that a crashed build frees its streams within one scheduler interval.
+LEASE_STALE_SECONDS = 900
+
+# How often a running stream refreshes its lease heartbeat — docs/05 §5.5.
+# The engine refreshes between batches (see runner), skipping the write when
+# fewer than this many seconds have elapsed since the last heartbeat, so a
+# fast many-batch stream does not hammer the destination with lease writes.
+LEASE_HEARTBEAT_INTERVAL_SECONDS = 60
+
+# How often a running stream flushes its in-progress state (cursor + state_blob)
+# to the destination mid-stream — docs/05 §5.2. Without this, a stream's state
+# was committed only ONCE, after its batch loop finished; an interruption
+# (build timeout, cancel, crash) lost every mid-stream `state.set(...)` the
+# connector made — most critically a bootstrap's resume pointer. On restart the
+# stream then resumed from the last *persisted* pointer (far behind where it had
+# actually written) and, for an `append` stream, re-appended the whole overlap
+# as duplicates. Flushing between batches — always AFTER the batch's rows are
+# durable — bounds that re-append to at most one batch (the one whose rows
+# landed but whose state flush had not yet fired), which the destination's
+# primary-key dedup absorbs. Throttled like the lease heartbeat so a fast
+# many-batch stream does not pay a state write (a MERGE/DML on some warehouses)
+# per batch — the exact per-batch cost `append` mode exists to avoid.
+STATE_COMMIT_INTERVAL_SECONDS = 60
+
+
+class LeaseStatus(_StrEnum):
+    """Lifecycle status of a ``_dtex_leases`` row — docs/05 §5.5."""
+
+    RUNNING = "running"
+    """A build is actively running this stream; heartbeat is being refreshed."""
+    DONE = "done"
+    """The stream finished; the lease is released and re-acquirable."""
+    FAILED = "failed"
+    """The stream errored; the lease is released (a terminal, non-live state)."""
+
+
+@dataclass
+class LeaseRecord:
+    """One ``_dtex_leases`` row — a stream's cross-build run lease (docs/05 §5.5).
+
+    Primary key is ``(connector, stream)`` — the same keying as
+    :class:`StateRecord`, so state and lease line up per stream. A lease is
+    *live* (blocks another build from running the stream) when its status is
+    ``running`` AND its ``heartbeat_at`` is within
+    :data:`LEASE_STALE_SECONDS` of now. Any other combination — a terminal
+    status, or a ``running`` row whose heartbeat went stale because the holder
+    crashed — is dead and freely re-acquirable.
+
+    # NOTE: not frozen — the engine stamps ``heartbeat_at`` in place across a
+    # run. Round-trips via ``to_row`` / ``from_row`` are the persistence
+    # boundary, matching :class:`StateRecord`.
+    """
+
+    connector: str
+    stream: str
+    run_id: str
+    status: LeaseStatus = LeaseStatus.RUNNING
+    acquired_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+
+    def is_live(self, *, now: datetime, stale_seconds: int = LEASE_STALE_SECONDS) -> bool:
+        """Is this lease currently blocking (running + fresh heartbeat)?
+
+        A ``running`` lease whose ``heartbeat_at`` is older than
+        ``stale_seconds`` is treated as dead (crashed holder) and returns
+        ``False`` so a new build can reclaim it. Terminal statuses
+        (``done`` / ``failed``) are never live.
+        """
+        if self.status is not LeaseStatus.RUNNING:
+            return False
+        if self.heartbeat_at is None:
+            return False
+        # A destination whose TIMESTAMP columns are timezone-naive (DuckDB —
+        # see its commit_state NOTE) hands back a naive heartbeat; ``now`` is
+        # UTC-aware. Both represent a UTC wall-clock instant, so coerce a naive
+        # value to UTC rather than crash on the aware/naive subtraction.
+        beat = self.heartbeat_at
+        if beat.tzinfo is None:
+            beat = beat.replace(tzinfo=UTC)
+        reference = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+        age = (reference - beat).total_seconds()
+        return age <= stale_seconds
+
+    def to_row(self) -> dict[str, Any]:
+        """Serialize to a plain dict matching the ``_dtex_leases`` columns."""
+        return {
+            "connector": self.connector,
+            "stream": self.stream,
+            "run_id": self.run_id,
+            "status": self.status.value,
+            "acquired_at": None if self.acquired_at is None else self.acquired_at.isoformat(),
+            "heartbeat_at": (
+                None if self.heartbeat_at is None else self.heartbeat_at.isoformat()
+            ),
+        }
+
+    @classmethod
+    def from_row(cls, row: Mapping[str, Any]) -> LeaseRecord:
+        """Deserialize a ``_dtex_leases`` row read back from a destination."""
+        return cls(
+            connector=str(row["connector"]),
+            stream=str(row["stream"]),
+            run_id=str(row["run_id"]),
+            status=LeaseStatus.parse(row["status"]),
+            acquired_at=_parse_dt(row.get("acquired_at")),
+            heartbeat_at=_parse_dt(row.get("heartbeat_at")),
+        )
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """The frozen, fully resolved config for one run — docs/02 stage 2 RESOLVE.
+
+    The engine merges every config layer (register.yaml defaults → project →
+    profiles → env → CLI/run kwargs) into this single immutable object; after
+    it is built, nothing reads ambient config. It names the run's *intent*
+    (which pipeline, which source, which target, which streams, full-refresh or
+    not) and carries the resolved :class:`Config` handed to connector code.
+
+    # NOTE: ``connector`` keeps meaning "source connector name" — the
+    # ``_dtex_state.connector`` column is keyed by source so a re-run of a
+    # different config against the same source reuses state correctly. The
+    # ``pipeline`` field names the :class:`PipelineConfig` the run was driven
+    # from (the CLI's ``-p/--conf`` arg).
+    """
+
+    run_id: str
+    pipeline: str
+    connector: str
+    target: str
+    config: Config
+    select: tuple[str, ...] = ()
+    full_refresh: bool = False
+    dry_run: bool = False
+    # Per-invocation replacement for every selected stream's declared
+    # ``incremental.lookback`` (``dtex run --lookback``). ``None`` keeps each
+    # stream's own. Lets one config re-walk a short window on a frequent
+    # schedule and the full declared window on a rarer one.
+    lookback: str | None = None
+    # Value-level drift policy for the NORMALIZE step (docs/02 §Normalize).
+    # Resolved from ``dtex_project.yml``'s ``schema_drift:`` key; defaults to
+    # ``warn`` so a stale declared schema degrades instead of failing the run.
+    schema_drift: SchemaDrift = SchemaDrift.WARN
+
+    @property
+    def is_select_all(self) -> bool:
+        """``True`` when no ``--select`` subset was given — run every stream."""
+        return not self.select
+
+    def selects(self, stream_name: str) -> bool:
+        """Whether ``stream_name`` is in scope for this run — docs/07 §2 ``--select``."""
+        return self.is_select_all or stream_name in self.select
+
+
+@dataclass
+class StreamResult:
+    """Per-stream outcome inside a :class:`RunResult` — docs/07 §4.1, docs/09 §2.
+
+    The structured record of one stream's run: how many rows moved and where
+    its cursor stood before and after.
+    """
+
+    name: str
+    rows_extracted: int = 0
+    rows_loaded: int = 0
+    cursor_before: Any = None
+    cursor_after: Any = None
+    status: StreamStatus = StreamStatus.SUCCEEDED
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to the per-stream JSON shape of the run record — docs/09 §4."""
+        return {
+            "name": self.name,
+            "rows_extracted": self.rows_extracted,
+            "rows_loaded": self.rows_loaded,
+            "cursor_before": self.cursor_before,
+            "cursor_after": self.cursor_after,
+            "status": self.status.value,
+        }
+
+
+@dataclass
+class RunResult:
+    """The structured outcome of one run — docs/07 §4.1, docs/09 §4.
+
+    The same object ``project.run()`` returns and the engine persists as the
+    run record (``_dtex_runs`` row / ``.dtex/runs/<run_id>.json``).
+    ``project.run()`` does **not** raise on failure — it returns a ``RunResult``
+    with ``status=FAILED`` and a populated ``error``.
+
+    # NOTE: field set follows docs/07 §4.1 (the canonical ``RunResult``
+    # definition the handbook gives in code), which includes ``target`` and
+    # ``log_path``. The task description's prose bullet omitted those two; the
+    # explicit handbook dataclass wins. ``destination`` is added because the
+    # docs/09 §4 run-record JSON carries it and it is not otherwise
+    # recoverable from this object alone.
+    """
+
+    run_id: str
+    config: str
+    connector: str
+    target: str
+    destination: str
+    status: RunStatus
+    started_at: datetime
+    ended_at: datetime
+    streams: list[StreamResult] = field(default_factory=list)
+    rows_loaded: int = 0
+    full_refresh: bool = False
+    error: BaseException | None = None
+    log_path: str = ""
+
+    @property
+    def duration_s(self) -> float:
+        """Wall-clock run duration in seconds — docs/09 §4 ``duration_s``."""
+        return (self.ended_at - self.started_at).total_seconds()
+
+    def stream(self, name: str) -> StreamResult | None:
+        """Look up a stream's result by name; ``None`` if absent."""
+        for s in self.streams:
+            if s.name == name:
+                return s
+        return None
+
+    def raise_for_status(self) -> RunResult:
+        """Raise :attr:`error` if the run failed; otherwise return ``self``.
+
+        The opt-in exception path described in docs/07 §4.1 — callers wanting
+        exceptions use ``project.run(...).raise_for_status()``.
+        """
+        if self.status is RunStatus.FAILED and self.error is not None:
+            raise self.error
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to the run-record JSON shape — docs/09 §4.
+
+        ``error`` is rendered as ``"<ExcType>: <message>"`` (or ``None``); the
+        logging layer is responsible for secret redaction within it (docs/09 §5).
+        """
+        return {
+            "run_id": self.run_id,
+            "config": self.config,
+            "connector": self.connector,
+            "target": self.target,
+            "destination": self.destination,
+            "status": self.status.value,
+            "started_at": self.started_at.isoformat(),
+            "ended_at": self.ended_at.isoformat(),
+            "duration_s": self.duration_s,
+            "rows_loaded": self.rows_loaded,
+            "full_refresh": self.full_refresh,
+            "streams": [s.to_dict() for s in self.streams],
+            "error": (
+                None
+                if self.error is None
+                else f"{type(self.error).__name__}: {self.error}"
+            ),
+        }
+
+
+# ---------------------------------------------------------------------------
+# RunRecord — the persistence-layer twin of RunResult (docs/09 §4)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunRecord:
+    """One row in ``_dtex_runs`` — the queryable audit record of one run.
+
+    docs/09 §4: where :class:`RunResult` is the in-memory shape the library
+    returns and the JSONL file is the *narrative*, ``RunRecord`` is the
+    *receipt* — the destination-persisted summary one row of ``_dtex_runs``
+    carries. The engine builds one from the completed :class:`RunResult`
+    and hands it to ``@destination.write_run_record``.
+
+    # NOTE: ``traceback`` is intentionally **not** a field. A full traceback is
+    # often huge, frequently embeds filesystem paths and identifiers, and would
+    # bloat every ``_dtex_runs`` row in a way that confounds SQL drill-down.
+    # The traceback IS written (once, in full) to the per-run JSONL log file
+    # (docs/09 §3.2) — the JSONL is for forensics, the table is for
+    # queryability. ``error_type`` + ``error_message`` give a SQL caller the
+    # filterable shape ("which runs failed with ``HTTPError``?") without
+    # forcing a join through unstructured text.
+
+    # NOTE: frozen because once a run finishes the record is the canonical
+    # immutable artifact of that run. A retry of the destination write
+    # rebinds the same record; an in-place mutation would muddy the audit
+    # promise.
+    """
+
+    run_id: str
+    config: str
+    source: str
+    destination: str
+    target: str
+    status: RunStatus
+    started_at: datetime
+    ended_at: datetime
+    rows_loaded: int
+    streams: tuple[StreamResult, ...] = ()
+    full_refresh: bool = False
+    error_type: str | None = None
+    error_message: str | None = None
+
+    @property
+    def duration_s(self) -> float:
+        """Wall-clock run duration in seconds — docs/09 §4 ``duration_s``."""
+        return (self.ended_at - self.started_at).total_seconds()
+
+    def streams_json(self) -> list[dict[str, Any]]:
+        """The per-stream breakdown for the ``streams_json`` table column.
+
+        docs/09 §4: a JSON array under one column so an admin/UI can drill
+        down without joining. Uses :meth:`StreamResult.to_dict` so the per-
+        stream shape matches the JSONL log's ``stream_end`` event exactly.
+        """
+        return [s.to_dict() for s in self.streams]
+
+
+# ---------------------------------------------------------------------------
+# PipelineConfig — the parsed configs/<name>.yml file (docs/06, docs/12)
+# ---------------------------------------------------------------------------
+
+
+class StreamMode(StrEnum):
+    """How a stream is run THIS invocation — docs/12 §3.
+
+    Set per-stream in a config's ``streams:`` block. Independent of the
+    stream's *capability* (whether ``register.yaml`` declares an
+    ``incremental:`` block) — that's a property of the stream itself.
+
+    * ``INCREMENTAL`` — read the cursor from ``_dtex_state``, advance it
+      on success. Requires the stream to declare an ``incremental:``
+      block in its ``register.yaml``.
+    * ``FULL_REFRESH`` — do NOT read, advance, or reset the cursor.
+      Every run pulls from the stream's ``initial_value`` (or the
+      config-supplied ``since:`` override). State is left untouched so
+      a sibling incremental config keeps its cursor intact.
+
+    The string values match what a user writes in YAML
+    (``mode: full_refresh``).
+    """
+
+    INCREMENTAL = "incremental"
+    FULL_REFRESH = "full_refresh"
+
+
+@dataclass(frozen=True)
+class StreamRunConfig:
+    """Per-stream run-shape declared in a config's ``streams:`` block — docs/12 §3.
+
+    A ``register.yaml`` declares a stream's *identity* (cursor field/type,
+    primary key, schema, extraction logic). This object declares the
+    per-pipeline *run-shape* — what mode the stream runs in this
+    invocation, what cursor floor to use, what per-stream source-param
+    overrides apply, what physical partition layout the destination
+    should produce.
+
+    Fields:
+
+    * ``mode`` — ``incremental`` or ``full_refresh``. ``None`` means
+      "use the stream's natural mode" (incremental if the source
+      declares an ``incremental:`` block, full_refresh otherwise).
+    * ``since`` — one-shot cursor floor for this run only; ignored
+      when ``mode`` resolves to full_refresh. Does NOT mutate
+      ``_dtex_state``. The engine uses this VERBATIM as the seed
+      for the run (not max(since, prior_state)) — explicit "re-pull
+      from here" semantics.
+    * ``params`` — per-stream source-param overrides. Sits at
+      precedence layer 4 (between config-level ``params`` and
+      ``DTEX_PARAM_<NAME>``); see docs/03 §6.
+    * ``partition`` — destination partition declaration; same shape
+      as ``StreamDef.partition_by`` (string short form OR
+      :class:`PartitionConfig` long form). Overrides whatever the
+      source declares for this stream.
+    * ``schema`` — typed additions to the source schema, for promoted or
+      account-specific fields. Existing declared types/modes cannot change;
+      on schemaless sources these fields override inference only.
+    """
+
+    mode: StreamMode | None = None
+    since: Any | None = None
+    params: Mapping[str, Any] = field(default_factory=dict)
+    partition: PartitionConfig | None = None
+    schema: Schema | None = None
+
+    @classmethod
+    def from_yaml_value(cls, value: Any, *, stream_name: str, config_name: str) -> StreamRunConfig:
+        """Parse one entry of a config's ``streams:`` block — docs/12 §2.
+
+        Accepts three forms:
+
+        * ``None`` (an empty mapping value, e.g. ``my_stream:``) — all defaults.
+        * A bare string (``my_stream: full_refresh``) — interpreted as
+          ``{mode: <string>}``.
+        * A mapping with any subset of {``mode``, ``since``, ``params``,
+          ``partition``, ``schema``}.
+
+        Unknown sub-keys are rejected (matches the codebase's "unknown
+        YAML key is a hard error" stance — catches typos like ``mod``).
+        """
+        if value is None:
+            return cls()
+        if isinstance(value, str):
+            return cls(
+                mode=_parse_stream_mode(value, stream_name=stream_name, config_name=config_name)
+            )
+        if not isinstance(value, Mapping):
+            raise ValueError(
+                f"config {config_name!r}: streams[{stream_name!r}] must be a "
+                f"mapping, a bare mode string, or null; got {type(value).__name__}"
+            )
+        known = {"mode", "since", "params", "partition", "schema"}
+        unknown = set(value) - known
+        if unknown:
+            raise ValueError(
+                f"config {config_name!r}: streams[{stream_name!r}]: unknown key(s) "
+                f"{', '.join(repr(k) for k in sorted(unknown))}; "
+                f"valid: {', '.join(sorted(known))}"
+            )
+
+        mode_raw = value.get("mode")
+        mode = (
+            _parse_stream_mode(mode_raw, stream_name=stream_name, config_name=config_name)
+            if mode_raw is not None
+            else None
+        )
+
+        params_raw = value.get("params") or {}
+        if not isinstance(params_raw, Mapping):
+            raise ValueError(
+                f"config {config_name!r}: streams[{stream_name!r}].params must be "
+                f"a mapping; got {type(params_raw).__name__}"
+            )
+
+        partition_raw = value.get("partition")
+        if partition_raw is None:
+            partition: PartitionConfig | None = None
+        elif isinstance(partition_raw, (str, Mapping)):
+            # PartitionConfig.from_dict accepts both shapes — short string form
+            # becomes TIME+DAY on the named field (PartitionConfig.from_short),
+            # mapping is the explicit long form. Promoting here means the
+            # runner sees a uniform PartitionConfig regardless of YAML shape.
+            try:
+                partition = PartitionConfig.from_dict(partition_raw)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"config {config_name!r}: streams[{stream_name!r}].partition: {exc}"
+                ) from exc
+        else:
+            raise ValueError(
+                f"config {config_name!r}: streams[{stream_name!r}].partition must be "
+                f"a string (short form) or mapping (long form); "
+                f"got {type(partition_raw).__name__}"
+            )
+
+        schema_raw = value.get("schema")
+        schema = None
+        if schema_raw is not None:
+            context = f"config {config_name!r}: streams[{stream_name!r}].schema"
+            if not isinstance(schema_raw, list) or any(
+                not isinstance(item, Mapping) for item in schema_raw
+            ):
+                raise ValueError(f"{context} must be a list of field mappings")
+            try:
+                schema = Schema.from_list(schema_raw)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"{context}: {exc}") from exc
+            assert schema is not None
+            if len(set(schema.names)) != len(schema.names):
+                raise ValueError(f"{context}: duplicate field names")
+            if any(not name.strip() or name == Schema.SYNCED_AT_COLUMN for name in schema.names):
+                raise ValueError(f"{context}: empty or reserved field name")
+
+        return cls(
+            mode=mode,
+            since=value.get("since"),
+            params=dict(params_raw),
+            partition=partition,
+            schema=schema,
+        )
+
+
+def _parse_stream_mode(value: Any, *, stream_name: str, config_name: str) -> StreamMode:
+    """Coerce a YAML scalar into a :class:`StreamMode` with a friendly error."""
+    if isinstance(value, StreamMode):
+        return value
+    try:
+        return StreamMode(str(value))
+    except ValueError:
+        valid = ", ".join(repr(m.value) for m in StreamMode)
+        raise ValueError(
+            f"config {config_name!r}: streams[{stream_name!r}]: unknown mode "
+            f"{value!r}; valid: {valid}"
+        ) from None
+
+
+# Sentinel string forms for ``streams: all`` / ``streams: "*"`` — the
+# explicit catch-all opt-in (docs/12 §2.3). Lowercased + stripped at
+# parse time so case/whitespace don't bite.
+_STREAMS_ALL_SENTINELS = frozenset({"all", "*"})
+
+
+def _parse_streams_block(
+    raw: Any, *, config_name: str
+) -> tuple[Mapping[str, StreamRunConfig], bool]:
+    """Parse a config's ``streams:`` block — docs/12 §2.
+
+    Three accepted shapes:
+
+    * Sentinel string ``"all"`` / ``"*"`` (case-insensitive, whitespace
+      stripped) → ``({}, True)``. Runner expands to every stream the
+      source declares at run time.
+    * Mapping ``{stream_name: <yaml>}`` → ``(dict, False)`` where each
+      value is parsed via :meth:`StreamRunConfig.from_yaml_value`.
+    * Anything else → :class:`ValueError`.
+
+    Empty mapping / empty list / missing-after-required-check all fail
+    with the "must not be empty" message. The mandatory-presence check
+    itself lives in :meth:`PipelineConfig.from_dict`.
+    """
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in _STREAMS_ALL_SENTINELS:
+            return {}, True
+        raise ValueError(
+            f"config {config_name!r}: 'streams' string value must be "
+            f"'all' or '*' (the catch-all opt-in); got {raw!r}. To list "
+            f"streams explicitly, use a mapping like 'streams: {{my_stream: {{}} }}'"
+        )
+
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            f"config {config_name!r}: 'streams' must be a mapping of "
+            f"stream-name → per-stream-overrides, or the catch-all "
+            f"sentinel 'all'; got {type(raw).__name__}"
+        )
+
+    if not raw:
+        raise ValueError(
+            f"config {config_name!r}: 'streams' must not be empty (use "
+            f"'streams: all' to include every stream the source declares, "
+            f"or list streams by name with optional per-stream overrides)"
+        )
+
+    streams: dict[str, StreamRunConfig] = {}
+    for stream_name, value in raw.items():
+        name_str = str(stream_name)
+        streams[name_str] = StreamRunConfig.from_yaml_value(
+            value, stream_name=name_str, config_name=config_name
+        )
+    return streams, False
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    """One parsed pipeline config — a named binding of source + destination + target.
+
+    docs/12 §The config concept. A *config* is the runtime unit: one config =
+    one pipeline. It names which source feeds which destination at which
+    target, plus the params that customize both ends.
+
+    Discovery scans ``configs/*.yml`` and ``configs/*.yaml`` under the project
+    root; a file may carry one config (top-level keys ``name`` / ``source`` /
+    …) or many (under a ``configs:`` list). Duplicate names across files are a
+    hard error at discovery time. The engine then resolves a config NAME to
+    one of these and runs its lifecycle.
+
+    # NOTE: ``PipelineConfig`` is the new first-class concept of stage 8.B.
+    # New per-pipeline concerns are added as fields here, never as new CLI
+    # flags or engine ``run()`` args — the same stability rule
+    # :class:`StreamMeta` follows for the destination contract.
+
+    Fields:
+
+    * ``name`` — config name; the CLI's ``-p/--conf`` matches this.
+    * ``source`` — source connector name (resolved project-local-first,
+      then baked — docs/03 §5).
+    * ``destination`` — destination connector name (same resolution rule).
+    * ``target`` — which ``profiles.yml[<destination>].targets[<target>]``
+      block supplies the destination's connection params. ``None`` falls
+      back to ``profiles.yml[<destination>].default_target`` (docs/06).
+    * ``params`` — source param overrides (a higher precedence layer than
+      ``register.yaml`` defaults and ``dtex_project.yml`` ``vars``; lower
+      than CLI ``--param`` / ``run(params_override=)``).
+    * ``destination_params`` — per-config destination param overrides
+      (higher than ``profiles.yml`` rows, lower than CLI
+      ``--destination-param``).
+    * ``select`` — streams to run; empty means "all". A CLI ``--select``
+      *replaces* (not unions) this list (docs/07).
+    * ``schedule`` — advisory cron expression for an external scheduler;
+      the engine itself never acts on it (docs/03 §2.6).
+    * ``tags`` — a bare list of strings used by ``dtex run --tag <tag>`` to
+      select every config that carries the tag (and by ``dtex list --tag``
+      to filter the catalog). Shape mirrors dbt's model ``tags:``. Tags are
+      normalized to lowercase at parse time and deduplicated. Empty by
+      default; selection is by exact match (no glob/regex). Config tags are
+      distinct from the ``tags:`` declared on a source/destination's
+      ``register.yaml`` — those remain *catalog* metadata used by
+      ``dtex list``, never by ``dtex run --tag``. Clean separation: source/
+      destination tags = "what this connector IS"; config tags = "how/when
+      to run this pipeline".
+
+    # NOTE: ``tags`` is appended after ``schedule`` (the original tail) so
+    # frozen positional callers in tests / older code that built a
+    # ``PipelineConfig(...)`` without keyword args keep working. All
+    # tail-field positional callers were already keyword-style (see
+    # ``test_engine.py::_empty_pipeline``), so this is a defensive measure.
+    """
+
+    name: str
+    source: str
+    destination: str
+    target: str | None = None
+    params: Mapping[str, Any] = field(default_factory=dict)
+    destination_params: Mapping[str, Any] = field(default_factory=dict)
+    streams: Mapping[str, StreamRunConfig] = field(default_factory=dict)
+    """Per-stream run-shape declarations — docs/12 §2.
+
+    Mandatory in every config. Keys are stream names, values are
+    :class:`StreamRunConfig` objects carrying the per-stream
+    ``mode`` / ``since`` / ``params`` / ``partition`` overrides.
+
+    When the user wrote ``streams: all`` (or ``streams: "*"``) this mapping
+    is empty AND :attr:`all_streams` is ``True`` — the runner expands "all"
+    against the source's declared streams at run time. When the user listed
+    streams explicitly, this mapping is non-empty and :attr:`all_streams`
+    is ``False``."""
+    all_streams: bool = False
+    """``True`` iff the config used the ``streams: all`` (or ``streams: "*"``)
+    catch-all sentinel — docs/12 §2.3. Mutually exclusive with a non-empty
+    :attr:`streams` mapping (enforced at parse time)."""
+    schedule: str | None = None
+    tags: tuple[str, ...] = ()
+    """Free-form labels used by ``dtex run --tag <tag>`` to select every config
+    that carries the tag (and by ``dtex list --tag`` for catalog filtering).
+
+    Normalized to lowercase + deduplicated at parse time (see
+    :meth:`from_dict`). Selection is by exact string match — no glob/regex.
+    Empty tuple by default. Distinct from the ``tags:`` declared on a
+    source/destination's ``register.yaml`` (those are *catalog* metadata
+    that ``dtex run --tag`` deliberately ignores)."""
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PipelineConfig:
+        """Build a :class:`PipelineConfig` from a parsed YAML mapping — docs/12.
+
+        Enforces the required keys (``name``, ``source``, ``destination``,
+        ``streams``) and rejects unknown top-level keys (catches typos like
+        ``destintion``). The mandatory ``streams:`` block accepts either the
+        catch-all sentinels ``all`` / ``"*"`` (sets :attr:`all_streams`) or
+        a mapping of ``{stream_name: StreamRunConfig-shaped-yaml}`` (parsed
+        per-entry by :meth:`StreamRunConfig.from_yaml_value`).
+
+        Legacy keys ``select`` and ``partition_overrides`` raise a clear
+        error pointing at the new location — both were subsumed by
+        ``streams:`` in this redesign (docs/_internal/streams-redesign-plan).
+        """
+        config_name = str(data.get("name", "<unknown>"))
+
+        # Legacy-key errors come BEFORE the unknown-key check so the message
+        # tells the user exactly where to move the value, instead of just
+        # "unknown key 'select'" (the unknown-key error is for typos).
+        if "select" in data:
+            raise ValueError(
+                f"config {config_name!r}: 'select' is no longer supported; "
+                f"list streams under 'streams:' instead (a listed stream is "
+                f"automatically selected)"
+            )
+        if "partition_overrides" in data:
+            raise ValueError(
+                f"config {config_name!r}: 'partition_overrides' is no longer "
+                f"supported; move partition specs under "
+                f"'streams.<stream_name>.partition'"
+            )
+
+        known = {
+            "name",
+            "source",
+            "destination",
+            "target",
+            "params",
+            "destination_params",
+            "streams",
+            "schedule",
+            "tags",
+        }
+        unknown = set(data) - known
+        if unknown:
+            raise ValueError(f"unknown config key(s): {', '.join(sorted(unknown))}")
+        for required in ("name", "source", "destination", "streams"):
+            if required not in data:
+                if required == "streams":
+                    raise ValueError(
+                        f"config {config_name!r}: 'streams' is required (use "
+                        f"'streams: all' to include every stream the source "
+                        f"declares, or list streams by name with optional "
+                        f"per-stream overrides)"
+                    )
+                raise ValueError(f"config requires a {required!r} key")
+
+        streams_raw = data["streams"]
+        streams, all_streams = _parse_streams_block(streams_raw, config_name=config_name)
+
+        # tags — bare list of strings, mirroring dbt's model `tags:`. A bare
+        # string (`tags: hourly`) is REJECTED with a clear error so the
+        # author writes `tags: [hourly]` explicitly — matches dbt's behavior
+        # and is the strongest long-run answer (silent string-to-list
+        # promotion would mask the intent at the YAML layer where the most
+        # eyes are). Tags are normalized to lowercase to avoid `Hourly` vs
+        # `hourly` footguns at `--tag` matching time, then deduplicated
+        # while preserving first-seen order so `tags: [hourly, hourly]`
+        # parses to `("hourly",)` instead of erroring.
+        tags_raw = data.get("tags") or []
+        if isinstance(tags_raw, str):
+            raise ValueError(
+                f"config {data['name']!r}: 'tags' must be a list of strings "
+                f"(got the bare string {tags_raw!r}); write `tags: [{tags_raw}]`"
+            )
+        if not isinstance(tags_raw, (list, tuple)):
+            raise ValueError(
+                f"config {data['name']!r}: 'tags' must be a list of strings"
+            )
+        seen: set[str] = set()
+        tags_list: list[str] = []
+        for raw_tag in tags_raw:
+            tag = str(raw_tag).strip().lower()
+            if not tag:
+                # A bare empty string would silently match an empty CLI
+                # `--tag ""` filter — reject so the YAML's intent stays
+                # explicit. # NOTE: matches the rest of the codebase's
+                # "unknown / malformed YAML is a hard error" stance.
+                raise ValueError(
+                    f"config {data['name']!r}: 'tags' entries must be "
+                    f"non-empty strings"
+                )
+            if tag in seen:
+                continue
+            seen.add(tag)
+            tags_list.append(tag)
+
+        target_raw = data.get("target")
+        schedule_raw = data.get("schedule")
+        return cls(
+            name=str(data["name"]),
+            source=str(data["source"]),
+            destination=str(data["destination"]),
+            target=None if target_raw is None else str(target_raw),
+            params=dict(data.get("params") or {}),
+            destination_params=dict(data.get("destination_params") or {}),
+            streams=streams,
+            all_streams=all_streams,
+            schedule=None if schedule_raw is None else str(schedule_raw),
+            tags=tuple(tags_list),
+        )

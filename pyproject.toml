@@ -1,0 +1,147 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dtex"
+version = "0.21.0"
+description = "dtex (data extraction tool) — an open-source Python EL tool: pipelines as configs, connectors as folders, CLI-first."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Albinas Plesnys" },
+]
+keywords = ["extract-load", "el", "elt", "data-engineering", "connectors", "dbt"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+# Base install includes everything needed for the baked connectors to work
+# at full capacity. Specifying extras to use a *baked* destination (e.g.
+# BigQuery, which dtex ships and tests in its own repo) is backwards; the
+# baked toolkit should Just Work after `pip install dtex`.
+#
+# Genuine extras remain for opt-in cloud paths that are NOT required for a
+# connector's basic operation:
+#   * `gcs` / `s3`  — filesystem-source cloud backends (local paths work
+#                     without them; only needed for `gs://` / `s3://` URIs)
+#   * `gcp-secrets`, `aws-secrets`, `vault` — secret managers (most users
+#                     start with `${env.X}` and never need these)
+dependencies = [
+    "pyyaml",
+    "click",
+    "duckdb",
+    "requests>=2.31",
+    "psycopg[binary]>=3.1",
+    # BigQuery destination (baked) — needs the GCP SDKs + pyarrow to stage
+    # Parquet via GCS and trigger LOAD jobs. Lazy-imported inside the
+    # destination, so a user who never touches BigQuery never pays the
+    # *initialization* cost — but the install cost is baseline.
+    "google-cloud-bigquery>=3.20",
+    "google-cloud-storage>=2.10",
+    "pyarrow>=15",
+    # google_sheets / google_drive sources — google-auth signs the Sheets and
+    # Drive API calls (already present through the GCP SDKs above; declared
+    # because the sources import it directly), openpyxl reads .xlsx files.
+    "google-auth>=2.20",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "types-PyYAML",
+    "types-requests",
+]
+# Filesystem-source cloud backends — only loaded if a stream targets a
+# `gs://` or `s3://` URI. Local files work without these.
+gcs = ["google-cloud-storage>=2.10"]
+s3 = ["boto3>=1.28"]
+# Secret-manager resolvers — only needed if profiles.yml uses `secret://`
+# URLs for the matching scheme. ${env.X} works for everyone without these.
+gcp-secrets = ["google-cloud-secret-manager>=2.20"]
+# NOTE: `boto3>=1.28` is ALSO declared under the `s3` extra (the
+# filesystem connector's S3 backend). Duplicating across extras is
+# harmless — pip dedupes. Removing it from either side would break
+# that extra's standalone install path.
+aws-secrets = ["boto3>=1.28"]
+vault = ["hvac>=2.0"]
+
+[project.scripts]
+dtex = "dtex.cli:main"
+
+[project.entry-points."dtex.secret_resolvers"]
+gcp-secret-manager = "dtex.secrets._gcp:GcpSecretManagerResolver"
+aws-secrets-manager = "dtex.secrets._aws:AwsSecretsManagerResolver"
+vault = "dtex.secrets._vault:VaultResolver"
+
+[project.urls]
+Homepage = "https://github.com/vej-ai/dtex"
+Documentation = "https://github.com/vej-ai/dtex/tree/main/docs"
+Source = "https://github.com/vej-ai/dtex"
+"Bug Tracker" = "https://github.com/vej-ai/dtex/issues"
+Changelog = "https://github.com/vej-ai/dtex/blob/main/CHANGELOG.md"
+
+[tool.hatch.build]
+include = [
+    "dtex/**",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["dtex"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "dtex/**",
+    "docs/**",
+    "tests/**",
+    "README.md",
+    "LICENSE",
+    "CONTRIBUTING.md",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+disallow_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+
+# pyarrow ships no py.typed marker and no bundled stubs; mypy >= 2.3 reports
+# untyped imports as errors by default, which turned CI red without a code
+# change. The imports are lazy (inside functions) and treated as Any — the
+# pre-2.3 behavior, restored explicitly.
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
+# openpyxl (google_drive's XLSX reader) ships no type information either; the
+# import is lazy and used as Any, the same treatment as pyarrow above.
+[[tool.mypy.overrides]]
+module = ["openpyxl", "openpyxl.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: tests that need a live external service (gated by env var, e.g. POSTGRES_TEST_URL)",
+]

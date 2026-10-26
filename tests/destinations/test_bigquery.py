@@ -793,6 +793,26 @@ def test_open_default_auth_type_is_oauth(
     assert conn.client.bq.credentials is None
 
 
+def test_open_job_timeout_defaults_to_1200(
+    bigquery_destination: LoadedConnector,
+    fake_bq: _FakeBigQueryModule,
+    fake_gcs: type[_FakeStorageClient],
+) -> None:
+    """The per-job timeout leaves room for LOAD jobs queued on the shared pool."""
+    conn = _open_with_fakes(bigquery_destination)
+    assert conn.client.job_timeout_seconds == 1200
+
+
+def test_open_job_timeout_overridable_via_param(
+    bigquery_destination: LoadedConnector,
+    fake_bq: _FakeBigQueryModule,
+    fake_gcs: type[_FakeStorageClient],
+) -> None:
+    """An explicit job_timeout_seconds param wins over the default."""
+    conn = _open_with_fakes(bigquery_destination, job_timeout_seconds=300)
+    assert conn.client.job_timeout_seconds == 300
+
+
 def test_open_oauth_ignores_leftover_credentials_path(
     bigquery_destination: LoadedConnector,
     fake_bq: _FakeBigQueryModule,

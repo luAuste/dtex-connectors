@@ -321,7 +321,7 @@ def open(config: Config) -> BQConn:  # noqa: A001 — hook name is fixed by the 
             f"bigquery destination: unknown auth_type {auth_type!r}; "
             f"use 'oauth' (default) or 'service_account'"
         )
-    job_timeout = int(config.get("job_timeout_seconds") or 300)
+    job_timeout = int(config.get("job_timeout_seconds") or 1200)
     retry_max = int(config.get("retry_max_attempts") or 5)
     retry_backoff = float(config.get("retry_backoff_seconds") or 1.0)
 

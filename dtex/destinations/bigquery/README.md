@@ -54,7 +54,7 @@ bigquery:
       location: US                     # default "US"
       staging_prefix: dtex/staging      # default
       credentials_path: ""             # empty = ADC
-      job_timeout_seconds: 300         # per BigQuery job
+      job_timeout_seconds: 1200        # per BigQuery job, incl. queue time
       retry_max_attempts: 5            # transient 429/5xx retries
       retry_backoff_seconds: 1.0       # exponential base
 ```

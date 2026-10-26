@@ -10,6 +10,15 @@ For what is *planned* — versus what has shipped — see
 
 ## [Unreleased]
 
+### Changed
+
+- **bigquery: `job_timeout_seconds` defaults to 1200 (was 300).** The
+  timeout covers the time a job sits queued, not just its run time, and
+  LOAD jobs on BigQuery's free shared slot pool can queue for more than
+  5 minutes at busy hours before running in about a second. The run then
+  failed with `TimeoutError` while the job itself later completed. Set
+  `job_timeout_seconds` explicitly to keep the old value.
+
 ### Fixed
 
 - **meta: "today" is the ad account's day, not UTC's.** Both streams now
